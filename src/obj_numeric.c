@@ -26,7 +26,12 @@ KRK_METHOD(int,__init__,{
 	if (IS_STRING(argv[1])) return krk_string_int(argc-1,&argv[1],0);
 	if (IS_FLOATING(argv[1])) return INTEGER_VAL(AS_FLOATING(argv[1]));
 	if (IS_BOOLEAN(argv[1])) return INTEGER_VAL(AS_BOOLEAN(argv[1]));
-	return krk_runtimeError(vm.exceptions->typeError, "%s() argument must be a string or a number, not '%s'", "int", krk_typeName(argv[1]));
+	KrkClass * type = krk_getType(argv[1]);
+	KrkValue method;
+	if (!krk_tableGet(&type->methods, OBJECT_VAL(S("__int__")), &method))
+		return krk_runtimeError(vm.exceptions->typeError, "%s() argument must be a string or a number, not '%s'", "int", krk_typeName(argv[1]));
+	krk_push(argv[1]);
+	return krk_callSimple(method, 1, 0);
 })
 
 KRK_METHOD(int,__str__,{
@@ -54,7 +59,13 @@ KRK_METHOD(float,__init__,{
 	if (IS_FLOATING(argv[1])) return argv[1];
 	if (IS_INTEGER(argv[1])) return FLOATING_VAL(AS_INTEGER(argv[1]));
 	if (IS_BOOLEAN(argv[1])) return FLOATING_VAL(AS_BOOLEAN(argv[1]));
-	return krk_runtimeError(vm.exceptions->typeError, "%s() argument must be a string or a number, not '%s'", "float", krk_typeName(argv[1]));
+
+	KrkClass * type = krk_getType(argv[1]);
+	KrkValue method;
+	if (!krk_tableGet(&type->methods, OBJECT_VAL(S("__float__")), &method))
+		return krk_runtimeError(vm.exceptions->typeError, "%s() argument must be a string or a number, not '%s'", "float", krk_typeName(argv[1]));
+	krk_push(argv[1]);
+	return krk_callSimple(method, 1, 0);
 })
 
 KRK_METHOD(float,__int__,{ return INTEGER_VAL(self); })

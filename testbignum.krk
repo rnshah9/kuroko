@@ -1,0 +1,17 @@
+from bignum import bignum
+
+print(bignum(0))
+print(bignum(1))
+print(bignum(2))
+print(bignum(100000))
+print(bignum(100001))
+
+let o = bignum(100001)
+for i in range(110):
+    print(o)
+    o = o + 1000
+
+print(bignum(0xFFFFFF))
+print(bignum(0x1000000))
+print(bignum(0xFFFFFF) + 1)
+print(bignum(0xFFFFFF) + bignum(0xFFFFFF))

@@ -13,6 +13,7 @@
 #include <kuroko/object.h>
 #include <kuroko/table.h>
 #include <kuroko/util.h>
+#include <kuroko/bigint.h>
 
 #define KRK_VERSION_MAJOR  "1"
 #define KRK_VERSION_MINOR  "1"
@@ -1240,6 +1241,7 @@ void krk_initVM(int flags) {
 	_createAndBind_setClass();
 	_createAndBind_exceptions();
 	_createAndBind_generatorClass();
+	_createAndBind_bigintClass();
 	_createAndBind_gcMod();
 	_createAndBind_timeMod();
 	_createAndBind_osMod();
@@ -1382,10 +1384,16 @@ static KrkValue tryBind(const char * name, KrkValue a, KrkValue b, const char * 
  * Basic arithmetic and string functions follow.
  */
 
+#define __builtin_div_overflow(a,b,r) (*r = a / b, 0)
+#define krk_makeBigInt_div(a,b) NONE_VAL()
+
 #define MAKE_BIN_OP(name,operator) \
 	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		if (IS_INTEGER(a) && IS_INTEGER(b)) return INTEGER_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		if (IS_FLOATING(a)) { \
+		if (IS_INTEGER(a) && IS_INTEGER(b)) { \
+			krk_integer_type result; \
+			if (__builtin_ ## name ## _overflow(AS_INTEGER(a),AS_INTEGER(b), &result)) return krk_makeBigInt_ ## name (AS_INTEGER(a),AS_INTEGER(b)); \
+			return INTEGER_VAL(result); \
+		} else if (IS_FLOATING(a)) { \
 			if (IS_INTEGER(b)) return FLOATING_VAL(AS_FLOATING(a) operator (double)AS_INTEGER(b)); \
 			else if (IS_FLOATING(b)) return FLOATING_VAL(AS_FLOATING(a) operator AS_FLOATING(b)); \
 		} else if (IS_FLOATING(b)) { \
