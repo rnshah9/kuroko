@@ -1,0 +1,5 @@
+project: rnshah9/kuroko
+target: kuroko
+
+cmds:
+  - cmd: /repo/kuroko @@
