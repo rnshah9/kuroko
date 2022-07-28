@@ -2,4 +2,4 @@ project: kuroko
 target: kuroko
 
 cmds:
-  - cmd: /repo/kuroko @@
+  - cmd: /install/usr/local/bin/kuroko @@
