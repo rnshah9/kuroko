@@ -23,14 +23,11 @@
 /* Did you know this is actually specified to not exist in a header? */
 extern char ** environ;
 
-static KrkClass * OSError = NULL;
-static KrkClass * stat_result = NULL;
-
 #define DO_KEY(key) krk_attachNamedObject(AS_DICT(result), #key, (KrkObj*)krk_copyString(buf. key, strlen(buf .key)))
 #define S_KEY(key,val) krk_attachNamedObject(AS_DICT(result), #key, (KrkObj*)val);
 
 #ifndef _WIN32
-KRK_FUNC(uname,{
+KRK_Function(uname) {
 	struct utsname buf;
 	if (uname(&buf) < 0) return NONE_VAL();
 
@@ -44,9 +41,9 @@ KRK_FUNC(uname,{
 	DO_KEY(machine);
 
 	return krk_pop();;
-})
+}
 #else
-KRK_FUNC(uname,{
+KRK_Function(uname) {
 	KrkValue result = krk_dict_of(0, NULL, 0);
 	krk_push(result);
 
@@ -88,28 +85,25 @@ KRK_FUNC(uname,{
 	S_KEY(nodename,krk_copyString(buffer,dwSize));
 
 	return krk_pop();
-})
+}
 #endif
 
-static KrkClass * Environ;
-#define _Environ cls_Environ
-
 #define AS_Environ(o) (AS_INSTANCE(o))
-#define IS_Environ(o) (krk_isInstanceOf(o,Environ))
+#define IS_Environ(o) (krk_isInstanceOf(o,KRK_BASE_CLASS(Environ)))
 #define CURRENT_CTYPE KrkInstance*
 
 static int _setVar(KrkString * key, KrkString * val) {
 #ifndef _WIN32
 	return setenv(key->chars, val->chars, 1);
 #else
-	size_t len = key->length + val->length;
+	size_t len = key->length + val->length + 3;
 	char * tmp = malloc(len);
 	snprintf(tmp, len, "%s=%s", key->chars, val->chars);
 	return putenv(tmp);
 #endif
 }
 
-KRK_METHOD(Environ,__setitem__,{
+KRK_Method(Environ,__setitem__) {
 	METHOD_TAKES_EXACTLY(2);
 	CHECK_ARG(1,str,KrkString*,key);
 	CHECK_ARG(2,str,KrkString*,val);
@@ -121,8 +115,8 @@ KRK_METHOD(Environ,__setitem__,{
 		return krk_callDirect(vm.baseClasses->dictClass->_setter, 3);
 	}
 
-	return krk_runtimeError(OSError, "%s", strerror(errno));
-})
+	return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
+}
 
 static void _unsetVar(KrkString * str) {
 #ifndef _WIN32
@@ -136,22 +130,19 @@ static void _unsetVar(KrkString * str) {
 #endif
 }
 
-KRK_METHOD(Environ,__delitem__,{
+KRK_Method(Environ,__delitem__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,str,KrkString*,key);
 	_unsetVar(key);
 	krk_push(argv[0]);
 	krk_push(argv[1]);
 	return krk_callDirect(vm.baseClasses->dictClass->_delitem, 2);
-})
+}
 
 static void _loadEnviron(KrkInstance * module) {
 	/* Create a new class to subclass `dict` */
-	KrkString * className = S("_Environ");
-	krk_push(OBJECT_VAL(className));
-	Environ = krk_newClass(className, vm.baseClasses->dictClass);
+	KrkClass * Environ = krk_makeClass(module, &KRK_BASE_CLASS(Environ), "_Environ", vm.baseClasses->dictClass);
 	krk_attachNamedObject(&module->fields, "_Environ", (KrkObj*)Environ);
-	krk_pop(); /* className */
 
 	/* Add our set method that should also call dict's set method */
 	BIND_METHOD(Environ,__setitem__);
@@ -193,113 +184,116 @@ static void _loadEnviron(KrkInstance * module) {
 
 }
 
-KRK_FUNC(system,{
+KRK_Function(system) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,str,KrkString*,cmd);
 	return INTEGER_VAL(system(cmd->chars));
-})
+}
 
-KRK_FUNC(getcwd,{
+KRK_Function(getcwd) {
 	FUNCTION_TAKES_NONE();
 	char buf[4096]; /* TODO PATH_MAX? */
-	if (!getcwd(buf, 4096)) return krk_runtimeError(OSError, "%s", strerror(errno));
+	if (!getcwd(buf, 4096)) return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	return OBJECT_VAL(krk_copyString(buf, strlen(buf)));
-})
+}
 
-KRK_FUNC(chdir,{
+KRK_Function(chdir) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,str,KrkString*,newDir);
-	if (chdir(newDir->chars)) return krk_runtimeError(OSError, "%s", strerror(errno));
-})
+	if (chdir(newDir->chars)) return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
+	return NONE_VAL();
+}
 
-KRK_FUNC(getpid,{
+KRK_Function(getpid) {
 	FUNCTION_TAKES_NONE();
 	return INTEGER_VAL(getpid());
-})
+}
 
-KRK_FUNC(strerror,{
+KRK_Function(strerror) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,errorNo);
 	char *s = strerror(errorNo);
 	if (!s) return NONE_VAL();
 	return OBJECT_VAL(krk_copyString(s,strlen(s)));
-})
+}
 
-KRK_FUNC(access,{
+KRK_Function(access) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,str,KrkString*,path);
 	CHECK_ARG(1,int,krk_integer_type,mask);
 	if (access(path->chars, mask) == 0) return BOOLEAN_VAL(1);
 	return BOOLEAN_VAL(0);
-})
+}
 
-KRK_FUNC(abort,{
+KRK_Function(abort) {
 	abort();
-})
+}
 
-KRK_FUNC(exit,{
+KRK_Function(exit) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,retcode);
 	exit(retcode);
-})
+}
 
-KRK_FUNC(remove,{
+KRK_Function(remove) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,str,KrkString*,path);
 	if (remove(path->chars) != 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(truncate,{
+KRK_Function(truncate) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,str,KrkString*,path);
 	CHECK_ARG(1,int,krk_integer_type,length);
 	if (truncate(path->chars, length) != 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(dup,{
+KRK_Function(dup) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	int result = dup(fd);
 	if (result < 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(dup2,{
+KRK_Function(dup2) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	CHECK_ARG(1,int,krk_integer_type,fd2);
 	int result = dup2(fd,fd2);
 	if (result < 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(isatty,{
+KRK_Function(isatty) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	return BOOLEAN_VAL(isatty(fd));
-})
+}
 
-KRK_FUNC(lseek,{
+KRK_Function(lseek) {
 	FUNCTION_TAKES_EXACTLY(3);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	CHECK_ARG(1,int,krk_integer_type,pos);
 	CHECK_ARG(2,int,krk_integer_type,how);
 	off_t result = lseek(fd,pos,how);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(open,{
+KRK_Function(open) {
 	FUNCTION_TAKES_AT_LEAST(2);
 	FUNCTION_TAKES_AT_MOST(3);
 	CHECK_ARG(0,str,KrkString*,path);
@@ -311,23 +305,24 @@ KRK_FUNC(open,{
 	}
 	int result = open(path->chars, flags, mode);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(close,{
+KRK_Function(close) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	if (close(fd) == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
 #ifdef _WIN32
 #define mkdir(p,m) mkdir(p); (void)m
 #endif
-KRK_FUNC(mkdir,{
+KRK_Function(mkdir) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	FUNCTION_TAKES_AT_MOST(2);
 	CHECK_ARG(0,str,KrkString*,path);
@@ -338,11 +333,12 @@ KRK_FUNC(mkdir,{
 	}
 	int result = mkdir(path->chars, mode);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(read,{
+KRK_Function(read) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	CHECK_ARG(1,int,krk_integer_type,n);
@@ -351,98 +347,100 @@ KRK_FUNC(read,{
 	ssize_t result = read(fd,tmp,n);
 	if (result == -1) {
 		free(tmp);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	} else {
 		krk_push(OBJECT_VAL(krk_newBytes(result,tmp)));
 		free(tmp);
 		return krk_pop();
 	}
-})
+}
 
 #ifndef IS_bytes
 #define IS_bytes(o) IS_BYTES(o)
 #define AS_bytes(o) AS_BYTES(o)
 #endif
 
-KRK_FUNC(write,{
+KRK_Function(write) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	CHECK_ARG(1,bytes,KrkBytes*,data);
 	ssize_t result = write(fd,data->bytes,data->length);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
 #ifndef _WIN32
-KRK_FUNC(pipe,{
+KRK_Function(pipe) {
 	FUNCTION_TAKES_NONE();
 	int fds[2];
 	if (pipe(fds) == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	krk_push(OBJECT_VAL(krk_newTuple(2)));
 	AS_TUPLE(krk_peek(0))->values.values[0] = INTEGER_VAL(fds[0]);
 	AS_TUPLE(krk_peek(0))->values.values[1] = INTEGER_VAL(fds[1]);
 	AS_TUPLE(krk_peek(0))->values.count = 2;
 	return krk_pop();
-})
+}
 
-KRK_FUNC(kill,{
+KRK_Function(kill) {
 	FUNCTION_TAKES_EXACTLY(2);
 	int result = kill(AS_INTEGER(argv[0]), AS_INTEGER(argv[1]));
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(fork,{
+KRK_Function(fork) {
 	FUNCTION_TAKES_NONE();
 	return INTEGER_VAL(fork());
-})
+}
 
-KRK_FUNC(symlink,{
+KRK_Function(symlink) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,str,KrkString*,src);
 	CHECK_ARG(1,str,KrkString*,dst);
 	if (symlink(src->chars, dst->chars) != 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(tcgetpgrp,{
+KRK_Function(tcgetpgrp) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	int result = tcgetpgrp(fd);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return INTEGER_VAL(result);
-})
+}
 
-KRK_FUNC(tcsetpgrp,{
+KRK_Function(tcsetpgrp) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	CHECK_ARG(1,int,krk_integer_type,pgrp);
 	int result = tcsetpgrp(fd,pgrp);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(ttyname,{
+KRK_Function(ttyname) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,fd);
 	char * result = ttyname(fd);
 	if (!result) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 	return OBJECT_VAL(krk_copyString(result,strlen(result)));
-})
+}
 
-KRK_FUNC(get_terminal_size,{
+KRK_Function(get_terminal_size) {
 	FUNCTION_TAKES_AT_MOST(1);
 	int fd = 1;
 	if (argc > 0) {
@@ -454,7 +452,7 @@ KRK_FUNC(get_terminal_size,{
 	int res = ioctl(fd, TIOCGWINSZ, &wsz);
 
 	if (res < 0) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
 
 	krk_push(OBJECT_VAL(krk_newTuple(2)));
@@ -462,10 +460,10 @@ KRK_FUNC(get_terminal_size,{
 	AS_TUPLE(krk_peek(0))->values.values[1] = INTEGER_VAL(wsz.ws_row);
 	AS_TUPLE(krk_peek(0))->values.count = 2;
 	return krk_pop();
-})
+}
 #endif
 
-static int makeArgs(int count, KrkValue * values, char *** argsOut, const char * _method_name) {
+static int makeArgs(int count, const KrkValue * values, char *** argsOut, const char * _method_name) {
 	char ** out = malloc(sizeof(char*)*(count+1));
 	for (int i = 0; i < count; ++i) {
 		if (!IS_STRING(values[i])) {
@@ -480,31 +478,31 @@ static int makeArgs(int count, KrkValue * values, char *** argsOut, const char *
 	return 0;
 }
 
-KRK_FUNC(execl,{
+KRK_Function(execl) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	CHECK_ARG(0,str,KrkString*,path);
 	char ** args;
 	if (makeArgs(argc-1,&argv[1],&args,_method_name)) return NONE_VAL();
 	if (execv(path->chars, args) == -1) {
 		free(args);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	return krk_runtimeError(OSError, "Expected to not return from exec, but did.");
-})
+	return krk_runtimeError(KRK_EXC(OSError), "Expected to not return from exec, but did.");
+}
 
-KRK_FUNC(execlp,{
+KRK_Function(execlp) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	CHECK_ARG(0,str,KrkString*,filename);
 	char ** args;
 	if (makeArgs(argc-1,&argv[1],&args,_method_name)) return NONE_VAL();
 	if (execvp(filename->chars, args) == -1) {
 		free(args);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	return krk_runtimeError(OSError, "Expected to not return from exec, but did.");
-})
+	return krk_runtimeError(KRK_EXC(OSError), "Expected to not return from exec, but did.");
+}
 
-KRK_FUNC(execle,{
+KRK_Function(execle) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	CHECK_ARG(0,str,KrkString*,path);
 	CHECK_ARG((argc-1),list,KrkList*,envp);
@@ -518,12 +516,12 @@ KRK_FUNC(execle,{
 	if (execve(path->chars, args, env) == -1) {
 		free(args);
 		free(env);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	return krk_runtimeError(OSError, "Expected to not return from exec, but did.");
-})
+	return krk_runtimeError(KRK_EXC(OSError), "Expected to not return from exec, but did.");
+}
 
-KRK_FUNC(execv,{
+KRK_Function(execv) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,str,KrkString*,filename);
 	CHECK_ARG(1,list,KrkList*,args);
@@ -531,12 +529,12 @@ KRK_FUNC(execv,{
 	if (makeArgs(args->values.count, args->values.values, &argp,_method_name)) return NONE_VAL();
 	if (execv(filename->chars, argp) == -1) {
 		free(argp);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	return krk_runtimeError(OSError, "Expected to not return from exec, but did.");
-})
+	return krk_runtimeError(KRK_EXC(OSError), "Expected to not return from exec, but did.");
+}
 
-KRK_FUNC(execvp,{
+KRK_Function(execvp) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(0,str,KrkString*,path);
 	CHECK_ARG(1,list,KrkList*,args);
@@ -544,10 +542,10 @@ KRK_FUNC(execvp,{
 	if (makeArgs(args->values.count, args->values.values, &argp,_method_name)) return NONE_VAL();
 	if (execvp(path->chars, argp) == -1) {
 		free(argp);
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	return krk_runtimeError(OSError, "Expected to not return from exec, but did.");
-})
+	return krk_runtimeError(KRK_EXC(OSError), "Expected to not return from exec, but did.");
+}
 
 #define SET(thing) krk_attachNamedValue(&out->fields, #thing, INTEGER_VAL(buf. thing))
 #ifdef _WIN32
@@ -556,15 +554,15 @@ KRK_FUNC(execvp,{
 #else
 #define STAT_STRUCT struct stat
 #endif
-KRK_FUNC(stat,{
+KRK_Function(stat) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,str,KrkString*,path);
 	STAT_STRUCT buf;
 	int result = stat(path->chars, &buf);
 	if (result == -1) {
-		return krk_runtimeError(OSError, "%s", strerror(errno));
+		return krk_runtimeError(KRK_EXC(OSError), "%s", strerror(errno));
 	}
-	KrkInstance * out = krk_newInstance(stat_result);
+	KrkInstance * out = krk_newInstance(KRK_BASE_CLASS(stat_result));
 	krk_push(OBJECT_VAL(out));
 
 	SET(st_dev);
@@ -579,10 +577,10 @@ KRK_FUNC(stat,{
 	/* TODO block sizes */
 
 	return krk_pop();
-})
+}
 #undef SET
 
-#define IS_stat_result(o) (krk_isInstanceOf(o,stat_result))
+#define IS_stat_result(o) (krk_isInstanceOf(o,KRK_BASE_CLASS(stat_result)))
 #define AS_stat_result(o) AS_INSTANCE(o)
 #define CURRENT_NAME  self
 
@@ -591,7 +589,7 @@ KRK_FUNC(stat,{
 	krk_tableGet(&self->fields, OBJECT_VAL(S(#name)), &name); \
 	if (!IS_INTEGER(name)) return krk_runtimeError(vm.exceptions->valueError, "stat_result is invalid")
 
-KRK_METHOD(stat_result,__repr__,{
+KRK_Method(stat_result,__repr__) {
 	METHOD_TAKES_NONE();
 	getProp(st_dev);
 	getProp(st_ino);
@@ -623,48 +621,47 @@ KRK_METHOD(stat_result,__repr__,{
 	krk_push(OBJECT_VAL(krk_copyString(buf,len)));
 	free(buf);
 	return krk_pop();
-})
+}
 
-KRK_FUNC(S_ISBLK,{
+KRK_Function(S_ISBLK) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISBLK(mode));
-})
-KRK_FUNC(S_ISCHR,{
+}
+KRK_Function(S_ISCHR) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISCHR(mode));
-})
-KRK_FUNC(S_ISDIR,{
+}
+KRK_Function(S_ISDIR) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISDIR(mode));
-})
-KRK_FUNC(S_ISFIFO,{
+}
+KRK_Function(S_ISFIFO) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISFIFO(mode));
-})
-KRK_FUNC(S_ISREG,{
+}
+KRK_Function(S_ISREG) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISREG(mode));
-})
+}
 #ifndef _WIN32
-KRK_FUNC(S_ISLNK,{
+KRK_Function(S_ISLNK) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISLNK(mode));
-})
-KRK_FUNC(S_ISSOCK,{
+}
+KRK_Function(S_ISSOCK) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,int,krk_integer_type,mode);
 	return INTEGER_VAL(S_ISSOCK(mode));
-})
+}
 #endif
 
-_noexport
-void _createAndBind_osMod(void) {
+void krk_module_init_os(void) {
 	KrkInstance * module = krk_newInstance(vm.baseClasses->moduleClass);
 	krk_attachNamedObject(&vm.modules, "os", (KrkObj*)module);
 	krk_attachNamedObject(&module->fields, "__name__", (KrkObj*)S("os"));
@@ -728,7 +725,7 @@ void _createAndBind_osMod(void) {
 	DO_INT(SEEK_DATA);
 #endif
 
-	krk_makeClass(module, &OSError, "OSError", vm.exceptions->baseException);
+	KrkClass * OSError = krk_makeClass(module, &vm.exceptions->OSError, "OSError", vm.exceptions->baseException);
 	KRK_DOC(OSError,
 		"Raised when system functions return a failure code. @p Exception.arg will provide a textual description of the error."
 	);
@@ -887,7 +884,7 @@ void _createAndBind_osMod(void) {
 	_loadEnviron(module);
 
 	/* Nothing special */
-	krk_makeClass(module, &stat_result, "stat_result", vm.baseClasses->objectClass);
+	KrkClass * stat_result = krk_makeClass(module, &KRK_BASE_CLASS(stat_result), "stat_result", vm.baseClasses->objectClass);
 	BIND_METHOD(stat_result,__repr__);
 	krk_finalizeClass(stat_result);
 

@@ -5,6 +5,8 @@
 #include <kuroko/table.h>
 #include <kuroko/util.h>
 
+#include "private.h"
+
 #if defined(KRK_EXTENSIVE_MEMORY_DEBUGGING)
 /**
  * Extensive Memory Debugging
@@ -235,7 +237,7 @@ static void freeObject(KrkObj * object) {
 			krk_freeTable(&_class->methods);
 			krk_freeTable(&_class->subclasses);
 			if (_class->base) {
-				krk_tableDelete(&_class->base->subclasses, OBJECT_VAL(object));
+				krk_tableDeleteExact(&_class->base->subclasses, OBJECT_VAL(object));
 			}
 			FREE(KrkClass, object);
 			break;
@@ -345,6 +347,7 @@ static void blackenObject(KrkObj * object) {
 			}
 			krk_markValue(closure->annotations);
 			krk_markTable(&closure->fields);
+			krk_markValue(closure->globalsOwner);
 			break;
 		}
 		case KRK_OBJ_CODEOBJECT: {
@@ -353,7 +356,6 @@ static void blackenObject(KrkObj * object) {
 			krk_markObject((KrkObj*)function->qualname);
 			krk_markObject((KrkObj*)function->docstring);
 			krk_markObject((KrkObj*)function->chunk.filename);
-			krk_markObject((KrkObj*)function->globalsContext);
 			markArray(&function->requiredArgNames);
 			markArray(&function->keywordArgNames);
 			markArray(&function->chunk.constants);
@@ -445,7 +447,7 @@ static void tableRemoveWhite(KrkTable * table) {
 	for (size_t i = 0; i < table->capacity; ++i) {
 		KrkTableEntry * entry = &table->entries[i];
 		if (IS_OBJECT(entry->key) && !((AS_OBJECT(entry->key))->flags & KRK_OBJ_FLAGS_IS_MARKED)) {
-			krk_tableDelete(table, entry->key);
+			krk_tableDeleteExact(table, entry->key);
 		}
 	}
 }
@@ -473,8 +475,6 @@ static void markRoots() {
 		thread = thread->next;
 	}
 
-	krk_markCompilerRoots();
-
 	krk_markObject((KrkObj*)vm.builtins);
 	krk_markTable(&vm.modules);
 
@@ -485,6 +485,7 @@ static void markRoots() {
 	}
 }
 
+#ifndef KRK_NO_GC_TRACING
 static int smartSize(char _out[100], size_t s) {
 #if UINTPTR_MAX == 0xFFFFFFFF
 	size_t count = 3;
@@ -502,8 +503,10 @@ static int smartSize(char _out[100], size_t s) {
 	}
 	return snprintf(_out, 100, "%d B", (int)s);
 }
+#endif
 
 size_t krk_collectGarbage(void) {
+#ifndef KRK_NO_GC_TRACING
 	struct timespec outTime, inTime;
 
 	if (vm.globalFlags & KRK_GLOBAL_REPORT_GC_COLLECTS) {
@@ -511,6 +514,7 @@ size_t krk_collectGarbage(void) {
 	}
 
 	size_t bytesBefore = vm.bytesAllocated;
+#endif
 
 	markRoots();
 	traceReferences();
@@ -533,6 +537,7 @@ size_t krk_collectGarbage(void) {
 		vm.nextGC = vm.bytesAllocated + 0x4000000;
 	}
 
+#ifndef KRK_NO_GC_TRACING
 	if (vm.globalFlags & KRK_GLOBAL_REPORT_GC_COLLECTS) {
 		clock_gettime(CLOCK_MONOTONIC, &outTime);
 		struct timespec diff;
@@ -553,27 +558,30 @@ size_t krk_collectGarbage(void) {
 			(long long)diff.tv_sec, diff.tv_nsec,
 			smartBefore,smartAfter,smartFreed,(unsigned long long)out, smartNext);
 	}
+#endif
 	return out;
 }
 
-KRK_FUNC(collect,{
+#ifndef KRK_NO_SYSTEM_MODULES
+KRK_Function(collect) {
 	FUNCTION_TAKES_NONE();
 	if (&krk_currentThread != vm.threads) return krk_runtimeError(vm.exceptions->valueError, "only the main thread can do that");
 	return INTEGER_VAL(krk_collectGarbage());
-})
+}
 
-KRK_FUNC(pause,{
+KRK_Function(pause) {
 	FUNCTION_TAKES_NONE();
 	vm.globalFlags |= (KRK_GLOBAL_GC_PAUSED);
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(resume,{
+KRK_Function(resume) {
 	FUNCTION_TAKES_NONE();
 	vm.globalFlags &= ~(KRK_GLOBAL_GC_PAUSED);
-})
+	return NONE_VAL();
+}
 
-_noexport
-void _createAndBind_gcMod(void) {
+void krk_module_init_gc(void) {
 	/**
 	 * gc = module()
 	 *
@@ -592,3 +600,4 @@ void _createAndBind_gcMod(void) {
 	KRK_DOC(BIND_FUNC(gcModule,resume),
 		"@brief Re-enable automatic garbage collection after it was stopped by @ref pause ");
 }
+#endif

@@ -39,12 +39,13 @@ static int enableRline = 1;
 static int exitRepl = 0;
 static int pasteEnabled = 0;
 
-KRK_FUNC(exit,{
+KRK_Function(exit) {
 	FUNCTION_TAKES_NONE();
 	exitRepl = 1;
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(paste,{
+KRK_Function(paste) {
 	FUNCTION_TAKES_AT_MOST(1);
 	if (argc) {
 		CHECK_ARG(0,bool,int,enabled);
@@ -53,7 +54,8 @@ KRK_FUNC(paste,{
 		pasteEnabled = !pasteEnabled;
 	}
 	fprintf(stderr, "Pasting is %s.\n", pasteEnabled ? "enabled" : "disabled");
-})
+	return NONE_VAL();
+}
 
 static int doRead(char * buf, size_t bufSize) {
 #ifndef NO_RLINE
@@ -115,7 +117,7 @@ _exit:
  * In an interactive session, presents the configured prompt without
  * a trailing linefeed.
  */
-KRK_FUNC(input,{
+KRK_Function(input) {
 	FUNCTION_TAKES_AT_MOST(1);
 
 	char * prompt = "";
@@ -143,7 +145,7 @@ KRK_FUNC(input,{
 	}
 
 	return readLine(prompt, promptLength, syntaxHighlighter);
-})
+}
 
 #ifndef NO_RLINE
 /**
@@ -162,20 +164,30 @@ static KrkValue findFromProperty(KrkValue current, KrkToken next) {
 	return value;
 }
 
+static char * syn_krk_keywords[] = {
+	"and","class","def","else","for","if","in","import","del",
+	"let","not","or","return","while","try","except","raise",
+	"continue","break","as","from","elif","lambda","with","is",
+	"pass","assert","yield","finally","async","await",
+	"True","False","None",
+	NULL
+};
+
 static void tab_complete_func(rline_context_t * c) {
 	/* Figure out where the cursor is and if we should be completing anything. */
 	if (c->offset) {
+		size_t stackIn = krk_currentThread.stackTop - krk_currentThread.stack;
 		/* Copy up to the cursor... */
 		char * tmp = malloc(c->offset + 1);
 		memcpy(tmp, c->buffer, c->offset);
 		tmp[c->offset] = '\0';
 		/* and pass it to the scanner... */
-		krk_initScanner(tmp);
+		KrkScanner scanner = krk_initScanner(tmp);
 		/* Logically, there can be at most (offset) tokens, plus some wiggle room. */
 		KrkToken * space = malloc(sizeof(KrkToken) * (c->offset + 2));
 		int count = 0;
 		do {
-			space[count++] = krk_scanToken();
+			space[count++] = krk_scanToken(&scanner);
 		} while (space[count-1].type != TOKEN_EOF && space[count-1].type != TOKEN_ERROR);
 
 		/* If count == 1, it was EOF or an error and we have nothing to complete. */
@@ -229,6 +241,17 @@ static void tab_complete_func(rline_context_t * c) {
 				n -= 2; /* To skip every other dot. */
 			}
 
+			if (isGlobal && n < count && (space[count-n-1].type == TOKEN_IMPORT || space[count-n-1].type == TOKEN_FROM)) {
+				KrkInstance * modules = krk_newInstance(vm.baseClasses->objectClass);
+				root = OBJECT_VAL(modules);
+				krk_push(root);
+				for (size_t i = 0; i < vm.modules.capacity; ++i) {
+					KrkTableEntry * entry = &vm.modules.entries[i];
+					if (IS_KWARGS(entry->key)) continue;
+					krk_attachNamedValue(&modules->fields, AS_CSTRING(entry->key), NONE_VAL());
+				}
+			}
+
 			/* Now figure out what we're completing - did we already have a partial symbol name? */
 			int length = (space[count-base].type == TOKEN_DOT) ? 0 : (space[count-base].length);
 			isGlobal = isGlobal && (length != 0);
@@ -253,14 +276,15 @@ static void tab_complete_func(rline_context_t * c) {
 					KrkToken asToken = {.start = s->chars, .literalWidth = s->length};
 					KrkValue thisValue = findFromProperty(root, asToken);
 					krk_push(thisValue);
-					if (IS_CLOSURE(thisValue) || IS_BOUND_METHOD(thisValue) ||
-						(IS_NATIVE(thisValue) && !(((KrkNative*)AS_OBJECT(thisValue))->flags & KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY))) {
+					if (IS_CLOSURE(thisValue) || IS_BOUND_METHOD(thisValue) || IS_NATIVE(thisValue)) {
 						size_t allocSize = s->length + 2;
 						char * tmp = malloc(allocSize);
 						size_t len = snprintf(tmp, allocSize, "%s(", s->chars);
 						s = krk_takeString(tmp, len);
 						krk_pop();
 						krk_push(OBJECT_VAL(s));
+					} else {
+						krk_pop();
 					}
 
 					/* If this symbol is shorter than the current submatch, skip it. */
@@ -291,7 +315,6 @@ static void tab_complete_func(rline_context_t * c) {
 					root = OBJECT_VAL(vm.builtins);
 					continue;
 				} else if (isGlobal && AS_OBJECT(root) == (KrkObj*)vm.builtins) {
-					extern char * syn_krk_keywords[];
 					KrkInstance * fakeKeywordsObject = krk_newInstance(vm.baseClasses->objectClass);
 					root = OBJECT_VAL(fakeKeywordsObject);
 					krk_push(root);
@@ -358,7 +381,7 @@ _toomany:
 _cleanup:
 		free(tmp);
 		free(space);
-		krk_resetStack();
+		krk_currentThread.stackTop = &krk_currentThread.stack[stackIn];
 		return;
 	}
 }
@@ -456,7 +479,7 @@ static int debuggerHook(KrkCallFrame * frame) {
 					krk_debug_disableSingleStep();
 					/* Turn our compiled expression into a callable. */
 					krk_push(OBJECT_VAL(expression));
-					krk_push(OBJECT_VAL(krk_newClosure(expression)));
+					krk_push(OBJECT_VAL(krk_newClosure(expression, OBJECT_VAL(krk_currentThread.module))));
 					krk_swap(1);
 					krk_pop();
 					/* Stack silliness, don't ask. */
@@ -883,7 +906,7 @@ _finishArgs:
 	for (int arg = optind; arg < argc; ++arg) {
 		krk_push(OBJECT_VAL(krk_copyString(argv[arg],strlen(argv[arg]))));
 	}
-	KrkValue argList = krk_callNativeOnStack(krk_list_of, argc - optind + (optind == argc), &krk_currentThread.stackTop[-(argc - optind + (optind == argc))], 0);
+	KrkValue argList = krk_callNativeOnStack(argc - optind + (optind == argc), &krk_currentThread.stackTop[-(argc - optind + (optind == argc))], 0, krk_list_of);
 	krk_push(argList);
 	krk_attachNamedValue(&vm.system->fields, "argv", argList);
 	krk_pop();

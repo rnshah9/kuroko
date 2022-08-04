@@ -2,7 +2,7 @@
 
 #include <kuroko/kuroko.h>
 
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 #include <kuroko/util.h>
 
 #include <unistd.h>
@@ -18,9 +18,6 @@
 #else
 # define gettid() -1
 #endif
-
-static KrkClass * ThreadError;
-static KrkClass * Thread;
 
 /**
  * @brief Object representation of a system thread.
@@ -41,8 +38,6 @@ struct Thread {
 	unsigned int    alive:1;
 };
 
-static KrkClass * Lock;
-
 /**
  * @brief Simple atomic structure for waiting.
  * @extends KrkInstance
@@ -54,19 +49,19 @@ struct Lock {
 	pthread_mutex_t mutex;
 };
 
-KRK_FUNC(current_thread,{
+KRK_Function(current_thread) {
 	if (&krk_currentThread == vm.threads) return NONE_VAL();
 	return krk_currentThread.stack[0];
-})
+}
 
-#define IS_Thread(o)  (krk_isInstanceOf(o, Thread))
+#define IS_Thread(o)  (krk_isInstanceOf(o, KRK_BASE_CLASS(Thread)))
 #define AS_Thread(o)  ((struct Thread *)AS_OBJECT(o))
 #define CURRENT_CTYPE struct Thread *
 #define CURRENT_NAME  self
 
 static volatile int _threadLock = 0;
 static void * _startthread(void * _threadObj) {
-#if defined(ENABLE_THREADING) && defined(__APPLE__) && defined(__aarch64__)
+#if defined(__APPLE__) && defined(__aarch64__)
 	krk_forceThreadData();
 #endif
 	memset(&krk_currentThread, 0, sizeof(KrkThreadState));
@@ -87,7 +82,7 @@ static void * _startthread(void * _threadObj) {
 	KrkValue runMethod = NONE_VAL();
 	KrkClass * ourType = self->inst._class;
 	if (!krk_tableGet(&ourType->methods, OBJECT_VAL(S("run")), &runMethod)) {
-		krk_runtimeError(ThreadError, "Thread object has no run() method");
+		krk_runtimeError(KRK_EXC(ThreadError), "Thread object has no run() method");
 	} else {
 		krk_push(runMethod);
 		krk_push(OBJECT_VAL(self));
@@ -115,49 +110,50 @@ static void * _startthread(void * _threadObj) {
 	return NULL;
 }
 
-KRK_METHOD(Thread,tid,{
+KRK_Method(Thread,tid) {
 	METHOD_TAKES_NONE(); /* Property, but can not be assigned. */
 	return INTEGER_VAL(self->tid);
-})
+}
 
-KRK_METHOD(Thread,join,{
+KRK_Method(Thread,join) {
 	if (self->threadState == &krk_currentThread)
-		return krk_runtimeError(ThreadError, "Thread can not join itself.");
+		return krk_runtimeError(KRK_EXC(ThreadError), "Thread can not join itself.");
 	if (!self->started)
-		return krk_runtimeError(ThreadError, "Thread has not been started.");
+		return krk_runtimeError(KRK_EXC(ThreadError), "Thread has not been started.");
 
 	pthread_join(self->nativeRef, NULL);
-})
+	return NONE_VAL();
+}
 
-KRK_METHOD(Thread,start,{
+KRK_Method(Thread,start) {
 	METHOD_TAKES_NONE();
 
 	if (self->started)
-		return krk_runtimeError(ThreadError, "Thread has already been started.");
+		return krk_runtimeError(KRK_EXC(ThreadError), "Thread has already been started.");
 
 	self->started = 1;
 	self->alive   = 1;
 	pthread_create(&self->nativeRef, NULL, _startthread, (void*)self);
 
 	return argv[0];
-})
+}
 
-KRK_METHOD(Thread,is_alive,{
+KRK_Method(Thread,is_alive) {
 	METHOD_TAKES_NONE();
 	return BOOLEAN_VAL(self->alive);
-})
+}
 
 #undef CURRENT_CTYPE
 
-#define IS_Lock(o)  (krk_isInstanceOf(o, Lock))
+#define IS_Lock(o)  (krk_isInstanceOf(o, KRK_BASE_CLASS(Lock)))
 #define AS_Lock(o)  ((struct Lock *)AS_OBJECT(o))
 #define CURRENT_CTYPE struct Lock *
 
-KRK_METHOD(Lock,__init__,{
+KRK_Method(Lock,__init__) {
 	METHOD_TAKES_NONE(); /* TODO lock options, like recursive or error-checked? */
 	pthread_mutex_init(&self->mutex, NULL);
 	return argv[0];
-})
+}
 
 static inline void _pushLockStatus(struct Lock * self, struct StringBuilder * sb) {
 #ifdef __GLIBC__
@@ -174,7 +170,7 @@ static inline void _pushLockStatus(struct Lock * self, struct StringBuilder * sb
 #endif
 }
 
-KRK_METHOD(Lock,__repr__,{
+KRK_Method(Lock,__repr__) {
 	METHOD_TAKES_NONE();
 	struct StringBuilder sb = {0};
 	pushStringBuilderStr(&sb, "<Lock ", 6);
@@ -190,19 +186,20 @@ KRK_METHOD(Lock,__repr__,{
 
 	pushStringBuilder(&sb,'>');
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(Lock,__enter__,{
+KRK_Method(Lock,__enter__) {
 	METHOD_TAKES_NONE();
 	pthread_mutex_lock(&self->mutex);
-})
+	return NONE_VAL();
+}
 
-KRK_METHOD(Lock,__exit__,{
+KRK_Method(Lock,__exit__) {
 	pthread_mutex_unlock(&self->mutex);
-})
+	return NONE_VAL();
+}
 
-_noexport
-void _createAndBind_threadsMod(void) {
+void krk_module_init_threading(void) {
 	/**
 	 * threads = module()
 	 *
@@ -221,13 +218,13 @@ void _createAndBind_threadsMod(void) {
 		"@arguments \n\n"
 		"Returns the @ref Thread object associated with the calling thread, if one exists.");
 
-	krk_makeClass(threadsModule, &ThreadError, "ThreadError", vm.exceptions->baseException);
+	KrkClass * ThreadError = krk_makeClass(threadsModule, &KRK_EXC(ThreadError), "ThreadError", vm.exceptions->baseException);
 	KRK_DOC(ThreadError,
 		"Raised in various situations when an action on a thread is invalid."
 	);
 	krk_finalizeClass(ThreadError);
 
-	krk_makeClass(threadsModule, &Thread, "Thread", vm.baseClasses->objectClass);
+	KrkClass * Thread = krk_makeClass(threadsModule, &KRK_BASE_CLASS(Thread), "Thread", vm.baseClasses->objectClass);
 	KRK_DOC(Thread,
 		"Base class for building threaded execution contexts.\n\n"
 		"The @ref Thread class should be subclassed and the subclass should implement a @c run method."
@@ -239,7 +236,7 @@ void _createAndBind_threadsMod(void) {
 	KRK_DOC(BIND_PROP(Thread,tid), "The platform-specific thread identifier, if available. Usually an integer.");
 	krk_finalizeClass(Thread);
 
-	krk_makeClass(threadsModule, &Lock, "Lock", vm.baseClasses->objectClass);
+	KrkClass * Lock = krk_makeClass(threadsModule, &KRK_BASE_CLASS(Lock), "Lock", vm.baseClasses->objectClass);
 	KRK_DOC(Lock,
 		"Represents an atomic mutex.\n\n"
 		"@ref Lock objects allow for exclusive access to a resource and can be used in a @c with block."

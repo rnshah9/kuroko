@@ -55,7 +55,7 @@ inline int krk_hashValue(KrkValue value, uint32_t *hashOut) {
 	}
 _unhashable:
 	if (IS_NONE(krk_currentThread.currentException))
-		krk_runtimeError(vm.exceptions->typeError, "unhashable type: '%s'", krk_typeName(value));
+		krk_runtimeError(vm.exceptions->typeError, "unhashable type: '%T'", value);
 	return 1;
 }
 
@@ -75,7 +75,30 @@ KrkTableEntry * krk_findEntry(KrkTableEntry * entries, size_t capacity, KrkValue
 				if (tombstone == entry) return tombstone;
 				if (tombstone == NULL) tombstone = entry;
 			}
-		} else if (krk_valuesEqual(entry->key, key)) {
+		} else if (krk_valuesSameOrEqual(entry->key, key)) {
+			return entry;
+		}
+		index = (index + 1) & (capacity-1);
+	}
+}
+
+KrkTableEntry * krk_findEntryExact(KrkTableEntry * entries, size_t capacity, KrkValue key) {
+	uint32_t index;
+	if (krk_hashValue(key, &index)) {
+		return NULL;
+	}
+	index &= (capacity-1);
+	KrkTableEntry * tombstone = NULL;
+	for (;;) {
+		KrkTableEntry * entry = &entries[index];
+		if (IS_KWARGS(entry->key)) {
+			if (IS_NONE(entry->value)) {
+				return tombstone != NULL ? tombstone : entry;
+			} else {
+				if (tombstone == entry) return tombstone;
+				if (tombstone == NULL) tombstone = entry;
+			}
+		} else if (krk_valuesSame(entry->key, key)) {
 			return entry;
 		}
 		index = (index + 1) & (capacity-1);
@@ -133,6 +156,16 @@ int krk_tableSet(KrkTable * table, KrkValue key, KrkValue value) {
 	return isNewKey;
 }
 
+int krk_tableSetIfExists(KrkTable * table, KrkValue key, KrkValue value) {
+	if (table->count == 0) return 0;
+	KrkTableEntry * entry = krk_findEntry(table->entries, table->capacity, key);
+	if (!entry) return 0;
+	if (IS_KWARGS(entry->key)) return 0; /* Not found */
+	entry->key = key;
+	entry->value = value;
+	return 1;
+}
+
 void krk_tableAddAll(KrkTable * from, KrkTable * to) {
 	for (size_t i = 0; i < from->capacity; ++i) {
 		KrkTableEntry * entry = &from->entries[i];
@@ -158,8 +191,8 @@ int krk_tableGet_fast(KrkTable * table, KrkString * str, KrkValue * value) {
 	uint32_t index = str->obj.hash & (table->capacity-1);
 	for (;;) {
 		KrkTableEntry * entry = &table->entries[index];
-		if (IS_KWARGS(entry->key)) return 0;
-		if (IS_OBJECT(entry->key) && AS_OBJECT(entry->key) == (KrkObj*)str) {
+		if (entry->key == KWARGS_VAL(0)) return 0;
+		if (entry->key == OBJECT_VAL(str)) {
 			*value = entry->value;
 			return 1;
 		}
@@ -170,6 +203,18 @@ int krk_tableGet_fast(KrkTable * table, KrkString * str, KrkValue * value) {
 int krk_tableDelete(KrkTable * table, KrkValue key) {
 	if (table->count == 0) return 0;
 	KrkTableEntry * entry = krk_findEntry(table->entries, table->capacity, key);
+	if (!entry || IS_KWARGS(entry->key)) {
+		return 0;
+	}
+	table->count--;
+	entry->key = KWARGS_VAL(0);
+	entry->value = KWARGS_VAL(0);
+	return 1;
+}
+
+int krk_tableDeleteExact(KrkTable * table, KrkValue key) {
+	if (table->count == 0) return 0;
+	KrkTableEntry * entry = krk_findEntryExact(table->entries, table->capacity, key);
 	if (!entry || IS_KWARGS(entry->key)) {
 		return 0;
 	}

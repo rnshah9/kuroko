@@ -13,6 +13,40 @@ static KrkValue nativeFunctionName(KrkValue func) {
 	return OBJECT_VAL(krk_copyString(string,len));
 }
 
+static KrkTuple * functionArgs(KrkCodeObject * _self) {
+	KrkTuple * tuple = krk_newTuple(_self->requiredArgs + _self->keywordArgs + !!(_self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) + !!(_self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS));
+	krk_push(OBJECT_VAL(tuple));
+
+	for (short i = 0; i < _self->requiredArgs; ++i) {
+		tuple->values.values[tuple->values.count++] = _self->requiredArgNames.values[i];
+	}
+
+	for (short i = 0; i < _self->keywordArgs; ++i) {
+		struct StringBuilder sb = {0};
+		pushStringBuilderStr(&sb, AS_CSTRING(_self->keywordArgNames.values[i]), AS_STRING(_self->keywordArgNames.values[i])->length);
+		pushStringBuilder(&sb,'=');
+		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
+	}
+
+	if (_self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) {
+		struct StringBuilder sb = {0};
+		pushStringBuilder(&sb, '*');
+		pushStringBuilderStr(&sb, AS_CSTRING(_self->requiredArgNames.values[_self->requiredArgs]), AS_STRING(_self->requiredArgNames.values[_self->requiredArgs])->length);
+		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
+	}
+
+	if (_self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS) {
+		struct StringBuilder sb = {0};
+		pushStringBuilder(&sb, '*');
+		pushStringBuilder(&sb, '*');
+		pushStringBuilderStr(&sb, AS_CSTRING(_self->keywordArgNames.values[_self->keywordArgs]), AS_STRING(_self->keywordArgNames.values[_self->keywordArgs])->length);
+		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
+	}
+
+	krk_pop();
+	return tuple;
+}
+
 #define IS_method(o)     IS_BOUND_METHOD(o)
 #define IS_function(o)   (IS_CLOSURE(o)|IS_NATIVE(o))
 
@@ -22,7 +56,44 @@ static KrkValue nativeFunctionName(KrkValue func) {
 #define CURRENT_NAME  self
 #define CURRENT_CTYPE KrkValue
 
-KRK_METHOD(function,__doc__,{
+FUNC_SIG(function,__init__) {
+	static __attribute__ ((unused)) const char* _method_name = "__init__";
+	METHOD_TAKES_EXACTLY(3);
+	CHECK_ARG(1,codeobject,KrkCodeObject*,code);
+
+	if (!IS_INSTANCE(argv[3]))
+		return TYPE_ERROR(dict or instance object,argv[3]);
+
+	if (IS_CLOSURE(argv[2]) && AS_CLOSURE(argv[2])->upvalueCount == code->upvalueCount) {
+		/* Option 1: A function with the same upvalue count. Copy the upvalues exactly.
+		 *           As an example, this can be a lambda with a bunch of unused upvalue
+		 *           references - like "lambda: a, b, c". These variables will be captured
+		 *           using the relevant scope - and we don't have to care about whether
+		 *           they were properly marked, because the compiler took care of it
+		 *           when the lambda was compiled.
+		 */
+		krk_push(OBJECT_VAL(krk_newClosure(code, argv[3])));
+		memcpy(AS_CLOSURE(krk_peek(0))->upvalues, AS_CLOSURE(argv[2])->upvalues,
+			sizeof(KrkUpvalue*) * code->upvalueCount);
+		return krk_pop();
+	} else if (IS_TUPLE(argv[2]) && AS_TUPLE(argv[2])->values.count == code->upvalueCount) {
+		/* Option 2: A tuple of values. New upvalue containers are built for each value,
+		 *           but they are immediately closed with the value in the tuple. They
+		 *           exist independently for this closure instance, and are not shared with
+		 *           any other closures.
+		 */
+		krk_push(OBJECT_VAL(krk_newClosure(code, argv[3])));
+		for (size_t i = 0; i < code->upvalueCount; ++i) {
+			AS_CLOSURE(krk_peek(0))->upvalues[i] = krk_newUpvalue(-1);
+			AS_CLOSURE(krk_peek(0))->upvalues[i]->closed = AS_TUPLE(argv[2])->values.values[i];
+		}
+		return krk_pop();
+	}
+
+	return TYPE_ERROR(managed function with equal upvalue count or tuple,argv[2]);
+}
+
+KRK_Method(function,__doc__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 
 	if (IS_NATIVE(self) && AS_NATIVE(self)->doc) {
@@ -30,9 +101,11 @@ KRK_METHOD(function,__doc__,{
 	} else if (IS_CLOSURE(self) && AS_CLOSURE(self)->function->docstring) {
 		return OBJECT_VAL(AS_CLOSURE(self)->function->docstring);
 	}
-})
 
-KRK_METHOD(function,__name__,{
+	return NONE_VAL();
+}
+
+KRK_Method(function,__name__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 
 	if (IS_NATIVE(self)) {
@@ -42,17 +115,29 @@ KRK_METHOD(function,__name__,{
 	}
 
 	return OBJECT_VAL(S(""));
-})
+}
 
-KRK_METHOD(function,__qualname__,{
+KRK_Method(function,__qualname__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 
 	if (IS_CLOSURE(self) && AS_CLOSURE(self)->function->qualname) {
 		return OBJECT_VAL(AS_CLOSURE(self)->function->qualname);
 	}
-})
 
-KRK_METHOD(function,_ip_to_line,{
+	return NONE_VAL();
+}
+
+KRK_Method(function,__globals__) {
+	ATTRIBUTE_NOT_ASSIGNABLE();
+
+	if (IS_CLOSURE(self)) {
+		return AS_CLOSURE(self)->globalsOwner;
+	}
+
+	return NONE_VAL();
+}
+
+KRK_Method(function,_ip_to_line) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,int,krk_integer_type,ip);
 
@@ -61,9 +146,9 @@ KRK_METHOD(function,_ip_to_line,{
 	size_t line = krk_lineNumber(&AS_CLOSURE(self)->function->chunk, ip);
 
 	return INTEGER_VAL(line);
-})
+}
 
-KRK_METHOD(function,__str__,{
+KRK_Method(function,__str__) {
 	METHOD_TAKES_NONE();
 
 	struct StringBuilder sb = {0};
@@ -88,9 +173,9 @@ KRK_METHOD(function,__str__,{
 	pushStringBuilder(&sb,'>');
 
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(function,__file__,{
+KRK_Method(function,__file__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 
 	if (IS_NATIVE(self)) return OBJECT_VAL(S("<builtin>"));
@@ -98,66 +183,40 @@ KRK_METHOD(function,__file__,{
 	return AS_CLOSURE(self)->function->chunk.filename ?
 		OBJECT_VAL(AS_CLOSURE(self)->function->chunk.filename) :
 			OBJECT_VAL(S(""));
-})
+}
 
-KRK_METHOD(function,__args__,{
+KRK_Method(function,__args__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	if (!IS_CLOSURE(self)) return OBJECT_VAL(krk_newTuple(0));
-	KrkCodeObject * _self = AS_CLOSURE(self)->function;
-	KrkTuple * tuple = krk_newTuple(_self->requiredArgs + _self->keywordArgs + !!(_self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) + !!(_self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS));
-	krk_push(OBJECT_VAL(tuple));
-
-	for (short i = 0; i < _self->requiredArgs; ++i) {
-		tuple->values.values[tuple->values.count++] = _self->requiredArgNames.values[i];
-	}
-
-	for (short i = 0; i < _self->keywordArgs; ++i) {
-		struct StringBuilder sb = {0};
-		pushStringBuilderStr(&sb, AS_CSTRING(_self->keywordArgNames.values[i]), AS_STRING(_self->keywordArgNames.values[i])->length);
-		pushStringBuilder(&sb,'=');
-		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
-	}
-
-	if (_self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) {
-		struct StringBuilder sb = {0};
-		pushStringBuilder(&sb, '*');
-		pushStringBuilderStr(&sb, AS_CSTRING(_self->requiredArgNames.values[_self->requiredArgs]), AS_STRING(_self->requiredArgNames.values[_self->requiredArgs])->length);
-		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
-	}
-
-	if (_self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS) {
-		struct StringBuilder sb = {0};
-		pushStringBuilder(&sb, '*');
-		pushStringBuilder(&sb, '*');
-		pushStringBuilderStr(&sb, AS_CSTRING(_self->keywordArgNames.values[_self->keywordArgs]), AS_STRING(_self->keywordArgNames.values[_self->keywordArgs])->length);
-		tuple->values.values[tuple->values.count++] = finishStringBuilder(&sb);
-	}
-
-	krk_pop();
+	KrkTuple * tuple = functionArgs(AS_CLOSURE(self)->function);
 	return OBJECT_VAL(tuple);
-})
+}
 
-KRK_METHOD(function,__annotations__,{
+KRK_Method(function,__annotations__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	if (!IS_CLOSURE(self)) return NONE_VAL();
 	return AS_CLOSURE(self)->annotations;
-})
+}
 
-KRK_METHOD(function,__code__,{
+KRK_Method(function,__code__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	if (!IS_CLOSURE(self)) return NONE_VAL();
 	return OBJECT_VAL(AS_CLOSURE(self)->function);
-})
+}
 
 #undef CURRENT_CTYPE
 #define CURRENT_CTYPE KrkCodeObject*
 
-KRK_METHOD(codeobject,__name__,{
+FUNC_SIG(codeobject,__init__) {
+	return krk_runtimeError(vm.exceptions->typeError, "codeobject object is not instantiable");
+}
+
+KRK_Method(codeobject,__name__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	return self->name ? OBJECT_VAL(self->name) : OBJECT_VAL(S(""));
-})
+}
 
-KRK_METHOD(codeobject,__str__,{
+KRK_Method(codeobject,__str__) {
 	METHOD_TAKES_NONE();
 	KrkValue s = FUNC_NAME(codeobject,__name__)(1,argv,0);
 	if (!IS_STRING(s)) return NONE_VAL();
@@ -171,16 +230,16 @@ KRK_METHOD(codeobject,__str__,{
 
 	krk_pop();
 	return s;
-})
+}
 
-KRK_METHOD(codeobject,_ip_to_line,{
+KRK_Method(codeobject,_ip_to_line) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,int,krk_integer_type,ip);
 	size_t line = krk_lineNumber(&self->chunk, ip);
 	return INTEGER_VAL(line);
-})
+}
 
-KRK_METHOD(codeobject,__constants__,{
+KRK_Method(codeobject,__constants__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	krk_push(OBJECT_VAL(krk_newTuple(self->chunk.constants.count)));
 	memcpy(AS_TUPLE(krk_peek(0))->values.values,
@@ -188,10 +247,32 @@ KRK_METHOD(codeobject,__constants__,{
 		sizeof(KrkValue) * self->chunk.constants.count);
 	AS_TUPLE(krk_peek(0))->values.count = self->chunk.constants.count;
 	return krk_pop();
-})
+}
+
+KRK_Method(codeobject,co_code) {
+	return OBJECT_VAL(krk_newBytes(self->chunk.count, self->chunk.code));
+}
+
+KRK_Method(codeobject,co_argcount) {
+	return INTEGER_VAL(self->potentialPositionals);
+}
+
+KRK_Method(codeobject,__locals__) {
+	krk_push(OBJECT_VAL(krk_newTuple(self->localNameCount)));
+	for (size_t i = 0; i < self->localNameCount; ++i) {
+		krk_push(OBJECT_VAL(krk_newTuple(4)));
+		AS_TUPLE(krk_peek(0))->values.values[AS_TUPLE(krk_peek(0))->values.count++] = INTEGER_VAL(self->localNames[i].id);
+		AS_TUPLE(krk_peek(0))->values.values[AS_TUPLE(krk_peek(0))->values.count++] = INTEGER_VAL(self->localNames[i].birthday);
+		AS_TUPLE(krk_peek(0))->values.values[AS_TUPLE(krk_peek(0))->values.count++] = INTEGER_VAL(self->localNames[i].deathday);
+		AS_TUPLE(krk_peek(0))->values.values[AS_TUPLE(krk_peek(0))->values.count++] = OBJECT_VAL(self->localNames[i].name);
+		AS_TUPLE(krk_peek(1))->values.values[AS_TUPLE(krk_peek(1))->values.count++] = krk_peek(0);
+		krk_pop();
+	}
+	return krk_pop();
+}
 
 /* Python-compatibility */
-KRK_METHOD(codeobject,co_flags,{
+KRK_Method(codeobject,co_flags) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 
 	int out = 0;
@@ -199,33 +280,49 @@ KRK_METHOD(codeobject,co_flags,{
 	/* For compatibility with Python, mostly because these are specified
 	 * in at least one doc page with their raw values, we convert
 	 * our flags to the useful CPython flag values... */
-	if (self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) out |= 0x04;
-	if (self->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS)  out |= 0x08;
-	if (self->flags & KRK_CODEOBJECT_FLAGS_IS_GENERATOR)  out |= 0x20;
-	if (self->flags & KRK_CODEOBJECT_FLAGS_IS_COROUTINE)  out |= 0x80;
+	if (self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) out |= 0x04;
+	if (self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS)  out |= 0x08;
+	if (self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR)  out |= 0x20;
+	if (self->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE)  out |= 0x80;
 
 	return INTEGER_VAL(out);
-})
+}
+
+KRK_Method(codeobject,__args__) {
+	ATTRIBUTE_NOT_ASSIGNABLE();
+	KrkTuple * tuple = functionArgs(self);
+	return OBJECT_VAL(tuple);
+}
+
 
 #undef CURRENT_CTYPE
 #define CURRENT_CTYPE KrkBoundMethod*
 
-KRK_METHOD(method,__name__,{
-	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__name__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+/* __init__ here will be called with a dummy instance as argv[0]; avoid
+ * complications with method argument checking by not using KRK_METHOD. */
+FUNC_SIG(method,__init__) {
+	static __attribute__ ((unused)) const char* _method_name = "__init__";
+	METHOD_TAKES_EXACTLY(2);
+	if (!IS_OBJECT(argv[1])) return krk_runtimeError(vm.exceptions->typeError, "first argument must be a heap object");
+	return OBJECT_VAL(krk_newBoundMethod(argv[2],AS_OBJECT(argv[1])));
+}
 
-KRK_METHOD(method,__qualname__,{
+KRK_Method(method,__name__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__qualname__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__name__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,_ip_to_line,{
+KRK_Method(method,__qualname__) {
+	ATTRIBUTE_NOT_ASSIGNABLE();
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__qualname__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
+
+KRK_Method(method,_ip_to_line) {
 	METHOD_TAKES_EXACTLY(1);
-	return FUNC_NAME(function,_ip_to_line)(2,(KrkValue[]){OBJECT_VAL(self->method),argv[1]},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,_ip_to_line)(2,(KrkValue[]){OBJECT_VAL(self->method),argv[1]},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__str__,{
+KRK_Method(method,__str__) {
 	METHOD_TAKES_NONE();
 	KrkValue s = FUNC_NAME(method,__qualname__)(1,argv,0);
 	if (!IS_STRING(s)) s = FUNC_NAME(method,__name__)(1,argv,0);
@@ -243,83 +340,79 @@ KRK_METHOD(method,__str__,{
 	free(tmp);
 	krk_pop();
 	return s;
-})
+}
 
-KRK_METHOD(method,__file__,{
+KRK_Method(method,__file__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__file__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__file__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__args__,{
+KRK_Method(method,__args__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__args__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__args__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__doc__,{
+KRK_Method(method,__doc__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__doc__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__doc__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__annotations__,{
+KRK_Method(method,__annotations__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__annotations__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__annotations__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__code__,{
+KRK_Method(method,__code__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
-	return FUNC_NAME(function,__code__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0);
-})
+	return IS_function(OBJECT_VAL(self->method)) ? FUNC_NAME(function,__code__)(1,(KrkValue[]){OBJECT_VAL(self->method)},0) : OBJECT_VAL(S("?"));
+}
 
-KRK_METHOD(method,__func__,{
+KRK_Method(method,__func__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	return OBJECT_VAL(self->method);
-})
+}
 
-KRK_METHOD(method,__self__,{
+KRK_Method(method,__self__) {
 	ATTRIBUTE_NOT_ASSIGNABLE();
 	return OBJECT_VAL(self->receiver);
-})
+}
 
-KRK_FUNC(staticmethod,{
+KRK_Function(staticmethod) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,CLOSURE,KrkClosure*,method);
-	/* Make a copy */
-	krk_push(OBJECT_VAL(krk_newClosure(method->function)));
-	/* Copy upvalues */
-	for (size_t i = 0; i < method->upvalueCount; ++i) {
-		AS_CLOSURE(krk_peek(0))->upvalues[i] = method->upvalues[i];
-	}
-	AS_CLOSURE(krk_peek(0))->annotations = method->annotations;
-	AS_CLOSURE(krk_peek(0))->flags |= KRK_FUNCTION_FLAGS_IS_STATIC_METHOD;
-	return krk_pop();
-})
+	method->obj.flags &= ~(KRK_OBJ_FLAGS_FUNCTION_MASK);
+	method->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD;
+	return argv[0];
+}
 
-KRK_FUNC(classmethod,{
+KRK_Function(classmethod) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,CLOSURE,KrkClosure*,method);
-	/* Make a copy */
-	krk_push(OBJECT_VAL(krk_newClosure(method->function)));
-	/* Copy upvalues */
-	for (size_t i = 0; i < method->upvalueCount; ++i) {
-		AS_CLOSURE(krk_peek(0))->upvalues[i] = method->upvalues[i];
-	}
-	AS_CLOSURE(krk_peek(0))->annotations = method->annotations;
-	AS_CLOSURE(krk_peek(0))->flags |= KRK_FUNCTION_FLAGS_IS_CLASS_METHOD;
-	return krk_pop();
-})
+	method->obj.flags &= ~(KRK_OBJ_FLAGS_FUNCTION_MASK);
+	method->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD;
+	return argv[0];
+}
 
 _noexport
 void _createAndBind_functionClass(void) {
 	KrkClass * codeobject = ADD_BASE_CLASS(vm.baseClasses->codeobjectClass, "codeobject", vm.baseClasses->objectClass);
+	codeobject->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
+	BIND_METHOD(codeobject,__init__);
 	BIND_METHOD(codeobject,__str__);
 	BIND_METHOD(codeobject,_ip_to_line);
 	BIND_PROP(codeobject,__constants__);
 	BIND_PROP(codeobject,__name__);
 	BIND_PROP(codeobject,co_flags);
+	BIND_PROP(codeobject,co_code);
+	BIND_PROP(codeobject,co_argcount);
+	BIND_PROP(codeobject,__locals__);
+	BIND_PROP(codeobject,__args__);
 	krk_defineNative(&codeobject->methods, "__repr__", FUNC_NAME(codeobject,__str__));
 	krk_finalizeClass(codeobject);
 
 	KrkClass * function = ADD_BASE_CLASS(vm.baseClasses->functionClass, "function", vm.baseClasses->objectClass);
+	function->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
+	BIND_METHOD(function,__init__);
 	BIND_METHOD(function,__str__);
 	BIND_METHOD(function,_ip_to_line);
 	BIND_PROP(function,__doc__);
@@ -329,13 +422,16 @@ void _createAndBind_functionClass(void) {
 	BIND_PROP(function,__args__);
 	BIND_PROP(function,__annotations__);
 	BIND_PROP(function,__code__);
+	BIND_PROP(function,__globals__);
 	krk_defineNative(&function->methods, "__repr__", FUNC_NAME(function,__str__));
-	krk_defineNative(&function->methods, "__class_getitem__", KrkGenericAlias)->flags |= KRK_NATIVE_FLAGS_IS_CLASS_METHOD;
+	krk_defineNative(&function->methods, "__class_getitem__", krk_GenericAlias)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD;
 	krk_finalizeClass(function);
 
 	KrkClass * method = ADD_BASE_CLASS(vm.baseClasses->methodClass, "method", vm.baseClasses->objectClass);
+	method->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
 	BIND_METHOD(method,__str__);
 	BIND_METHOD(method,_ip_to_line);
+	BIND_METHOD(method,__init__);
 	BIND_PROP(method,__doc__);
 	BIND_PROP(method,__name__);
 	BIND_PROP(method,__qualname__);

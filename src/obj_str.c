@@ -4,33 +4,30 @@
 #include <kuroko/memory.h>
 #include <kuroko/util.h>
 
-static KrkValue FUNC_NAME(striterator,__init__)(int,KrkValue[],int);
+#include "private.h"
+
+static KrkValue FUNC_NAME(striterator,__init__)(int,const KrkValue[],int);
 
 #define CURRENT_CTYPE KrkString *
 #define CURRENT_NAME  self
 
 #define AT_END() (self->length == 0 || i == self->length - 1)
 
-#define PUSH_CHAR(c) do { if (stringCapacity < stringLength + 1) { \
-		size_t old = stringCapacity; stringCapacity = GROW_CAPACITY(old); \
-		stringBytes = GROW_ARRAY(char, stringBytes, old, stringCapacity); \
-	} stringBytes[stringLength++] = c; } while (0)
-
 #define KRK_STRING_FAST(string,offset)  (uint32_t)\
-	(string->type <= 1 ? ((uint8_t*)string->codes)[offset] : \
-	(string->type == 2 ? ((uint16_t*)string->codes)[offset] : \
+	((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) <= (KRK_OBJ_FLAGS_STRING_UCS1) ? ((uint8_t*)string->codes)[offset] : \
+	((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == (KRK_OBJ_FLAGS_STRING_UCS2) ? ((uint16_t*)string->codes)[offset] : \
 	((uint32_t*)string->codes)[offset]))
 
 #define CODEPOINT_BYTES(cp) (cp < 0x80 ? 1 : (cp < 0x800 ? 2 : (cp < 0x10000 ? 3 : 4)))
 
-KRK_METHOD(str,__ord__,{
+KRK_Method(str,__ord__) {
 	METHOD_TAKES_NONE();
 	if (self->codesLength != 1)
 		return krk_runtimeError(vm.exceptions->typeError, "ord() expected a character, but string of length %d found", (int)self->codesLength);
 	return INTEGER_VAL(krk_unicodeCodepoint(self,0));
-})
+}
 
-KRK_METHOD(str,__init__,{
+KRK_Method(str,__init__) {
 	/* Ignore argument which would have been an instance */
 	if (argc < 2) {
 		return OBJECT_VAL(S(""));
@@ -39,11 +36,11 @@ KRK_METHOD(str,__init__,{
 	if (IS_STRING(argv[1])) return argv[1]; /* strings are immutable, so we can just return the arg */
 	/* Find the type of arg */
 	krk_push(argv[1]);
-	if (!krk_getType(argv[1])->_tostr) return krk_runtimeError(vm.exceptions->typeError, "Can not convert %s to str", krk_typeName(argv[1]));
+	if (!krk_getType(argv[1])->_tostr) return krk_runtimeError(vm.exceptions->typeError, "Can not convert '%T' to str", argv[1]);
 	return krk_callDirect(krk_getType(argv[1])->_tostr, 1);
-})
+}
 
-KRK_METHOD(str,__add__,{
+KRK_Method(str,__add__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,str,KrkString*,them);
 	const char * a;
@@ -65,7 +62,11 @@ KRK_METHOD(str,__add__,{
 	chars[length] = '\0';
 
 	size_t cpLength = self->codesLength + them->codesLength;
-	KrkStringType type = self->type > them->type ? self->type : them->type;
+
+	int self_type = (self->obj.flags & KRK_OBJ_FLAGS_STRING_MASK);
+	int them_type = (them->obj.flags & KRK_OBJ_FLAGS_STRING_MASK);
+
+	KrkStringType type = self_type > them_type ? self_type : them_type;
 
 	/* Hashes can be extended, which saves us calculating the whole thing */
 	uint32_t hash = self->obj.hash;
@@ -76,48 +77,34 @@ KRK_METHOD(str,__add__,{
 	KrkString * result = krk_takeStringVetted(chars, length, cpLength, type, hash);
 	if (needsPop) krk_pop();
 	return OBJECT_VAL(result);
-})
+}
 
-KRK_METHOD(str,__hash__,{
+KRK_Method(str,__hash__) {
 	return INTEGER_VAL(self->obj.hash);
-})
+}
 
-KRK_METHOD(str,__len__,{
+KRK_Method(str,__len__) {
 	return INTEGER_VAL(self->codesLength);
-})
+}
 
-KRK_METHOD(str,__setitem__,{
+KRK_Method(str,__setitem__) {
 	return krk_runtimeError(vm.exceptions->typeError, "Strings are not mutable.");
-})
+}
 
 /* str.__int__(base=10) */
-KRK_METHOD(str,__int__,{
+KRK_Method(str,__int__) {
 	METHOD_TAKES_AT_MOST(1);
-	int base = (argc < 2 || !IS_INTEGER(argv[1])) ? 10 : (int)AS_INTEGER(argv[1]);
-	char * start = AS_CSTRING(argv[0]);
-
-	/*  These special cases for hexadecimal, binary, octal values. */
-	if (start[0] == '0' && (start[1] == 'x' || start[1] == 'X')) {
-		base = 16;
-		start += 2;
-	} else if (start[0] == '0' && (start[1] == 'b' || start[1] == 'B')) {
-		base = 2;
-		start += 2;
-	} else if (start[0] == '0' && (start[1] == 'o' || start[1] == 'O')) {
-		base = 8;
-		start += 2;
-	}
-	krk_integer_type value = parseStrInt(start, NULL, base);
-	return INTEGER_VAL(value);
-})
+	int base = (argc < 2 || !IS_INTEGER(argv[1])) ? 0 : (int)AS_INTEGER(argv[1]);
+	return krk_parse_int(AS_CSTRING(argv[0]), AS_STRING(argv[0])->length, base);
+}
 
 /* str.__float__() */
-KRK_METHOD(str,__float__,{
+KRK_Method(str,__float__) {
 	METHOD_TAKES_NONE();
 	return FLOATING_VAL(strtod(AS_CSTRING(argv[0]),NULL));
-})
+}
 
-KRK_METHOD(str,__getitem__,{
+KRK_Method(str,__getitem__) {
 	METHOD_TAKES_EXACTLY(1);
 	if (IS_INTEGER(argv[1])) {
 		CHECK_ARG(1,int,krk_integer_type,asInt);
@@ -125,7 +112,7 @@ KRK_METHOD(str,__getitem__,{
 		if (asInt < 0 || asInt >= (int)AS_STRING(argv[0])->codesLength) {
 			return krk_runtimeError(vm.exceptions->indexError, "String index out of range: " PRIkrk_int, asInt);
 		}
-		if (self->type == KRK_STRING_ASCII) {
+		if ((self->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_ASCII) {
 			return OBJECT_VAL(krk_copyString(self->chars + asInt, 1));
 		} else {
 			krk_unicodeString(self);
@@ -140,7 +127,7 @@ KRK_METHOD(str,__getitem__,{
 
 		if (step == 1) {
 			long len = end - start;
-			if (self->type == KRK_STRING_ASCII) {
+			if ((self->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_ASCII) {
 				return OBJECT_VAL(krk_copyString(self->chars + start, len));
 			} else {
 				size_t offset = 0;
@@ -175,19 +162,91 @@ KRK_METHOD(str,__getitem__,{
 	} else {
 		return TYPE_ERROR(int or slice, argv[1]);
 	}
-})
+}
+
+const char * krk_parseCommonFormatSpec(struct ParsedFormatSpec *result, const char * spec, size_t length);
+
+KRK_Method(str,__format__) {
+	METHOD_TAKES_EXACTLY(1);
+	CHECK_ARG(1,str,KrkString*,format_spec);
+
+	struct ParsedFormatSpec opts = {0};
+	const char * spec = krk_parseCommonFormatSpec(&opts, format_spec->chars, format_spec->length);
+	if (!spec) return NONE_VAL();
+
+	switch (*spec) {
+		case 0:   /* unspecified */
+		case 's':
+			break;
+		default:
+			return krk_runtimeError(vm.exceptions->valueError,
+				"Unknown format code '%c' for object of type '%s'",
+				*spec,
+				"str");
+	}
+
+	/* Note we're going to deal in codepoints exclusive here, so hold on to your hat. */
+	krk_unicodeString(self);
+
+	size_t actualLength = self->codesLength;
+
+	/* Restrict to the precision specified */
+	if (opts.hasPrecision && (size_t)opts.prec < actualLength) {
+		actualLength = opts.prec;
+	}
+
+	/* How much padding do we need? */
+	size_t padLeft = 0;
+	size_t padRight = 0;
+	if (opts.hasWidth && actualLength < (size_t)opts.width) {
+		if (!opts.align || opts.align == '<') {
+			padRight = opts.width - actualLength;
+		} else if (opts.align == '>' || opts.align == '=') {
+			padLeft = opts.width - actualLength;
+		} else if (opts.align == '^') {
+			padLeft = (opts.width - actualLength) / 2;
+			padRight = (opts.width - actualLength) - padLeft;
+		}
+	}
+
+	/* If there's no work to do, return self */
+	if (padLeft == 0 && padRight == 0 && actualLength == self->codesLength) {
+		return argv[0];
+	}
+
+	struct StringBuilder sb = {0};
+
+	/* Push left padding */
+	for (size_t i = 0; i < padLeft; ++i) {
+		pushStringBuilderStr(&sb, opts.fill, opts.fillSize);
+	}
+
+	/* Push codes from us */
+	size_t offset = 0;
+	for (size_t i = 0; i < actualLength; ++i) {
+		uint32_t cp = KRK_STRING_FAST(self,i);
+		size_t   bytes =  CODEPOINT_BYTES(cp);
+		pushStringBuilderStr(&sb, &self->chars[offset], bytes);
+		offset += bytes;
+	}
+
+	/* Push right padding */
+	for (size_t i = 0; i < padRight; ++i) {
+		pushStringBuilderStr(&sb, opts.fill, opts.fillSize);
+	}
+
+	return finishStringBuilder(&sb);
+}
 
 /* str.format(**kwargs) */
-KRK_METHOD(str,format,{
+KRK_Method(str,format) {
 	KrkValue kwargs = NONE_VAL();
 	if (hasKw) {
 		kwargs = argv[argc];
 	}
 
 	/* Read through `self` until we find a field specifier. */
-	size_t stringCapacity = 0;
-	size_t stringLength   = 0;
-	char * stringBytes    = 0;
+	struct StringBuilder sb = {0};
 
 	int counterOffset = 0;
 	char * erroneousField = NULL;
@@ -199,7 +258,7 @@ KRK_METHOD(str,format,{
 	for (size_t i = 0; i < self->length; i++, c++) {
 		if (*c == '{') {
 			if (!AT_END() && c[1] == '{') {
-				PUSH_CHAR('{');
+				pushStringBuilder(&sb, '{');
 				i++; c++; /* Skip both */
 				continue;
 			} else {
@@ -236,7 +295,7 @@ KRK_METHOD(str,format,{
 					} else if (counterOffset) {
 						goto _formatSwitchedNumbering;
 					} else {
-						positionalOffset = parseStrInt(fieldStart,NULL,10);
+						positionalOffset = strtoul(fieldStart,NULL,10);
 					}
 					if (positionalOffset >= argc - 1) {
 						erroneousIndex = positionalOffset;
@@ -273,14 +332,12 @@ KRK_METHOD(str,format,{
 					if (!IS_STRING(asString)) goto _freeAndDone;
 				}
 				krk_push(asString);
-				for (size_t i = 0; i < AS_STRING(asString)->length; ++i) {
-					PUSH_CHAR(AS_CSTRING(asString)[i]);
-				}
+				pushStringBuilderStr(&sb, AS_CSTRING(asString), AS_STRING(asString)->length);
 				krk_pop();
 			}
 		} else if (*c == '}') {
 			if (!AT_END() && c[1] == '}') {
-				PUSH_CHAR('}');
+				pushStringBuilder(&sb, '}');
 				i++; c++; /* Skip both */
 				continue;
 			} else {
@@ -288,14 +345,12 @@ KRK_METHOD(str,format,{
 				goto _formatError;
 			}
 		} else {
-			PUSH_CHAR(*c);
+			pushStringBuilder(&sb, *c);
 		}
 	}
 
-	KrkValue out = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
 	free(workSpace);
-	FREE_ARRAY(char,stringBytes,stringCapacity);
-	return out;
+	return finishStringBuilder(&sb);
 
 _formatError:
 	krk_runtimeError(vm.exceptions->typeError, "Error parsing format string: %s", errorStr);
@@ -315,12 +370,12 @@ _formatKeyError:
 	goto _freeAndDone;
 
 _freeAndDone:
-	FREE_ARRAY(char,stringBytes,stringCapacity);
+	discardStringBuilder(&sb);
 	free(workSpace);
 	return NONE_VAL();
-})
+}
 
-KRK_METHOD(str,__mul__,{
+KRK_Method(str,__mul__) {
 	METHOD_TAKES_EXACTLY(1);
 	if (!IS_INTEGER(argv[1])) return NOTIMPL_VAL();
 	CHECK_ARG(1,int,krk_integer_type,howMany);
@@ -338,45 +393,59 @@ KRK_METHOD(str,__mul__,{
 
 	*c = '\0';
 	return OBJECT_VAL(krk_takeString(out, totalLength));
-})
+}
 
-KRK_METHOD(str,__rmul__,{
+KRK_Method(str,__rmul__) {
 	METHOD_TAKES_EXACTLY(1);
 	if (IS_INTEGER(argv[1])) return FUNC_NAME(str,__mul__)(argc,argv,hasKw);
 	return NOTIMPL_VAL();
-})
+}
 
-#define unpackArray(counter, indexer) do { \
-	for (size_t i = 0; i < counter; ++i) { \
-		if (!IS_STRING(indexer)) { errorStr = krk_typeName(indexer); goto _expectedString; } \
-		krk_push(indexer); \
-		if (rIndex > 0) pushStringBuilderStr(&sb, self->chars, self->length); \
-		pushStringBuilderStr(&sb, AS_CSTRING(indexer), AS_STRING(indexer)->length); \
-		krk_pop(); \
-		rIndex++; \
-	} \
-} while (0)
+struct _str_join_context {
+	struct StringBuilder * sb;
+	KrkString * self;
+	int isFirst;
+};
+
+static int _str_join_callback(void * context, const KrkValue * values, size_t count) {
+	struct _str_join_context * _context = context;
+
+	for (size_t i = 0; i < count; ++i) {
+		if (!IS_STRING(values[i])) {
+			krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%T'",
+				"join", "str", values[i]);
+			return 1;
+		}
+
+		if (_context->isFirst) {
+			_context->isFirst = 0;
+		} else {
+			pushStringBuilderStr(_context->sb, (char*)_context->self->chars, _context->self->length);
+		}
+		pushStringBuilderStr(_context->sb, (char*)AS_STRING(values[i])->chars, AS_STRING(values[i])->length);
+	}
+
+	return 0;
+}
 
 /* str.join(list) */
-KRK_METHOD(str,join,{
+KRK_Method(str,join) {
 	METHOD_TAKES_EXACTLY(1);
-
-	const char * errorStr = NULL;
 	struct StringBuilder sb = {0};
 
-	size_t rIndex = 0;
-	unpackIterableFast(argv[1]);
+	struct _str_join_context context = {&sb, self, 1};
+
+	if (krk_unpackIterable(argv[1], &context, _str_join_callback)) {
+		discardStringBuilder(&sb);
+		return NONE_VAL();
+	}
 
 	return finishStringBuilder(&sb);
-
-_expectedString:
-	krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'", "join", "str", errorStr);
-	discardStringBuilder(&sb);
-})
+}
 
 static int isWhitespace(char c) {
 	return (c == ' ' || c == '\t' || c == '\n' || c == '\r');
-}\
+}
 
 static int substringMatch(const char * haystack, size_t haystackLen, const char * needle, size_t needleLength) {
 	if (haystackLen < needleLength) return 0;
@@ -387,7 +456,7 @@ static int substringMatch(const char * haystack, size_t haystackLen, const char 
 }
 
 /* str.__contains__ */
-KRK_METHOD(str,__contains__,{
+KRK_Method(str,__contains__) {
 	METHOD_TAKES_EXACTLY(1);
 	if (IS_NONE(argv[1])) return BOOLEAN_VAL(0);
 	CHECK_ARG(1,str,KrkString*,needle);
@@ -397,11 +466,11 @@ KRK_METHOD(str,__contains__,{
 		}
 	}
 	return BOOLEAN_VAL(0);
-})
+}
 
-static int charIn(char c, const char * str) {
-	for (const char * s = str; *s; s++) {
-		if (c == *s) return 1;
+static int charIn(uint32_t c, KrkString * str) {
+	for (size_t i = 0; i < str->codesLength; ++i) {
+		if (c == KRK_STRING_FAST(str,i)) return 1;
 	}
 	return 0;
 }
@@ -410,44 +479,48 @@ static int charIn(char c, const char * str) {
  * Implements all three of strip, lstrip, rstrip.
  * Set which = 0, 1, 2 respectively
  */
-static KrkValue _string_strip_shared(int argc, KrkValue argv[], int which) {
-	if (argc > 1 && IS_STRING(argv[1]) && AS_STRING(argv[1])->type != KRK_STRING_ASCII) {
-		return krk_runtimeError(vm.exceptions->notImplementedError, "str.strip() not implemented for Unicode strip lists");
-	}
-	size_t start = 0;
-	size_t end   = AS_STRING(argv[0])->length;
-	const char * subset = " \t\n\r";
+static KrkValue _string_strip_shared(int argc, const KrkValue argv[], int which) {
+	KrkString * subset = AS_STRING(vm.specialMethodNames[METHOD_STRSTRIP]);
 	if (argc > 1) {
 		if (IS_STRING(argv[1])) {
-			subset = AS_CSTRING(argv[1]);
+			subset = AS_STRING(argv[1]);
 		} else {
 			return krk_runtimeError(vm.exceptions->typeError, "argument to %sstrip() should be a string",
 				(which == 0 ? "" : (which == 1 ? "l" : "r")));
 		}
-	} else if (argc > 2) {
-		return krk_runtimeError(vm.exceptions->typeError, "%sstrip() takes at most one argument",
-			(which == 0 ? "" : (which == 1 ? "l" : "r")));
 	}
-	if (which < 2) while (start < end && charIn(AS_CSTRING(argv[0])[start], subset)) start++;
-	if (which != 1) while (end > start && charIn(AS_CSTRING(argv[0])[end-1], subset)) end--;
-	return OBJECT_VAL(krk_copyString(&AS_CSTRING(argv[0])[start], end-start));
+
+	KrkString * self = AS_STRING(argv[0]);
+	krk_unicodeString(self);
+	krk_unicodeString(subset);
+
+	uint32_t c;
+	size_t start = 0;
+	size_t end   = self->length;
+	int j = 0;
+	int k = self->codesLength - 1;
+
+	if (which < 2) while (start < end && charIn((c = KRK_STRING_FAST(self, j)), subset)) { j++; start += CODEPOINT_BYTES(c); }
+	if (which != 1) while (end > start && charIn((c = KRK_STRING_FAST(self, k)), subset)) { k--; end -= CODEPOINT_BYTES(c); }
+
+	return OBJECT_VAL(krk_copyString(&self->chars[start], end-start));
 }
 
-KRK_METHOD(str,strip,{
+KRK_Method(str,strip) {
 	METHOD_TAKES_AT_MOST(1); /* TODO */
 	return _string_strip_shared(argc,argv,0);
-})
-KRK_METHOD(str,lstrip,{
+}
+KRK_Method(str,lstrip) {
 	METHOD_TAKES_AT_MOST(1); /* TODO */
 	return _string_strip_shared(argc,argv,1);
-})
-KRK_METHOD(str,rstrip,{
+}
+KRK_Method(str,rstrip) {
 	METHOD_TAKES_AT_MOST(1); /* TODO */
 	return _string_strip_shared(argc,argv,2);
-})
+}
 
 #define strCompare(name,lop,iop,rop) \
-	KRK_METHOD(str,name,{ \
+	KRK_Method(str,name) { \
 		METHOD_TAKES_EXACTLY(1); \
 		if (!IS_STRING(argv[1])) { \
 			return NOTIMPL_VAL(); \
@@ -461,128 +534,215 @@ KRK_METHOD(str,rstrip,{
 			if (a[i] iop b[i]) return BOOLEAN_VAL(0); \
 		} \
 		return BOOLEAN_VAL((aLen rop bLen)); \
-	})
+	}
 
 strCompare(__gt__,>,<,>)
 strCompare(__lt__,<,>,<)
 strCompare(__ge__,>,<,>=)
 strCompare(__le__,<,>,<=)
 
-/** TODO but throw a more descriptive error for now */
-KRK_METHOD(str,__mod__,{
-	return krk_runtimeError(vm.exceptions->notImplementedError, "%%-formatting for strings is not yet available");
-})
+KRK_Method(str,__mod__) {
+	METHOD_TAKES_EXACTLY(1);
 
-/* str.split() */
-KRK_METHOD(str,split,{
-	METHOD_TAKES_AT_MOST(2);
-	if (argc > 1) {
-		if (!IS_STRING(argv[1])) {
-			return krk_runtimeError(vm.exceptions->typeError, "Expected separator to be a string");
-		} else if (AS_STRING(argv[1])->length == 0) {
-			return krk_runtimeError(vm.exceptions->valueError, "Empty separator");
-		}
-		if (argc > 2 && !IS_INTEGER(argv[2])) {
-			return krk_runtimeError(vm.exceptions->typeError, "Expected maxsplit to be an integer.");
-		} else if (argc > 2 && AS_INTEGER(argv[2]) == 0) {
-			return argv[0];
+	KrkTuple * myTuple;
+
+	if (IS_TUPLE(argv[1])) {
+		myTuple = AS_TUPLE(argv[1]);
+		krk_push(argv[1]);
+	} else {
+		myTuple = krk_newTuple(1);
+		krk_push(OBJECT_VAL(myTuple));
+		myTuple->values.values[myTuple->values.count++] = argv[1];
+	}
+
+	struct StringBuilder sb = {0};
+	size_t ti = 0;
+
+	for (size_t i = 0; i < self->length; ++i) {
+		if (self->chars[i] == '%') {
+			int backwards = 0;
+			size_t width = 0;
+			i++;
+
+			if (self->chars[i] == '%') {
+				pushStringBuilder(&sb, self->chars[i]);
+				continue;
+			}
+
+			if (self->chars[i] == '-') { backwards = 1; i++; }
+
+			while (self->chars[i] >= '0' && self->chars[i] <= '9') {
+				width = width * 10 + (self->chars[i] - '0');
+				i++;
+			}
+
+			if (self->chars[i] == 'i') {
+				if (ti >= myTuple->values.count) goto _notEnough;
+				KrkValue arg = myTuple->values.values[ti++];
+
+				if (IS_INTEGER(arg)) {
+					krk_push(INTEGER_VAL(AS_INTEGER(arg)));
+				} else if (IS_FLOATING(arg)) {
+					krk_push(INTEGER_VAL(AS_FLOATING(arg)));
+				} else {
+					krk_runtimeError(vm.exceptions->typeError, "%%i format: a number is required, not '%T'", arg);
+					goto _exception;
+				}
+				krk_push(krk_callDirect(krk_getType(arg)->_tostr, 1));
+				goto _doit;
+			} else if (self->chars[i] == 's') {
+				if (ti >= myTuple->values.count) goto _notEnough;
+				KrkValue arg = myTuple->values.values[ti++];
+				if (!krk_getType(arg)->_tostr) {
+					krk_runtimeError(vm.exceptions->typeError, "%%s format: cannot convert '%T' to string", arg);
+					goto _exception;
+				}
+
+				krk_push(arg);
+				krk_push(krk_callDirect(krk_getType(arg)->_tostr, 1));
+				goto _doit;
+			} else {
+				krk_runtimeError(vm.exceptions->typeError, "%%%c format string specifier unsupported",
+					self->chars[i]);
+				goto _exception;
+			}
+
+_doit:
+			if (!backwards && width > AS_STRING(krk_peek(0))->codesLength) {
+				while (width > AS_STRING(krk_peek(0))->codesLength) {
+					pushStringBuilder(&sb, ' ');
+					width--;
+				}
+			}
+
+			pushStringBuilderStr(&sb, AS_CSTRING(krk_peek(0)), AS_STRING(krk_peek(0))->length);
+			if (backwards && width > AS_STRING(krk_peek(0))->codesLength) {
+				while (width > AS_STRING(krk_peek(0))->codesLength) {
+					pushStringBuilder(&sb, ' ');
+					width--;
+				}
+			}
+			krk_pop();
+		} else {
+			pushStringBuilder(&sb, self->chars[i]);
 		}
 	}
+
+	if (ti != myTuple->values.count) {
+		krk_runtimeError(vm.exceptions->typeError, "not all arguments converted durin string formatting");
+		goto _exception;
+	}
+
+	krk_pop(); /* tuple */
+	return finishStringBuilder(&sb);
+
+_notEnough:
+	krk_runtimeError(vm.exceptions->typeError, "not enough arguments for string format");
+	goto _exception;
+
+_exception:
+	discardStringBuilder(&sb);
+	return NONE_VAL();
+}
+
+/* str.split() */
+KRK_Method(str,split) {
+	const char * sep = NULL;
+	size_t sepLen = 0;
+	int maxsplit = -1;
+
+	if (!krk_parseArgs(
+		".|z#i", (const char *[]){"sep","maxsplit"},
+		&sep, &sepLen,
+		&maxsplit)) {
+		return NONE_VAL();
+	}
+
+	if (sep && sepLen == 0) return krk_runtimeError(vm.exceptions->valueError, "Empty separator");
 
 	KrkValue myList = krk_list_of(0,NULL,0);
 	krk_push(myList);
 
 	size_t i = 0;
 	char * c = self->chars;
-	size_t count = 0;
+	ssize_t count = 0;
 
-	if (argc < 2) {
+	if (!sep) {
 		while (i != self->length) {
 			while (i != self->length && isWhitespace(*c)) {
-				i++; c++;
+				i++;
+				c++;
 			}
-			if (i != self->length) {
-				size_t stringCapacity = 0;
-				size_t stringLength   = 0;
-				char * stringBytes    = NULL;
-				while (i != self->length && !isWhitespace(*c)) {
-					PUSH_CHAR(*c);
-					i++; c++;
-				}
-				KrkValue tmp = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
-				FREE_ARRAY(char,stringBytes,stringCapacity);
-				krk_push(tmp);
-				krk_writeValueArray(AS_LIST(myList), tmp);
+			if (i == self->length) break;
+
+			if (count == maxsplit) {
+				krk_push(OBJECT_VAL(krk_copyString(&self->chars[i], self->length - i)));
+				krk_writeValueArray(AS_LIST(myList), krk_peek(0));
 				krk_pop();
+				break;
 			}
+
+			struct StringBuilder sb = {0};
+			while (i != self->length && !isWhitespace(*c)) {
+				pushStringBuilder(&sb, *c);
+				i++;
+				c++;
+			}
+			krk_push(finishStringBuilder(&sb));
+			krk_writeValueArray(AS_LIST(myList), krk_peek(0));
+			krk_pop();
+			count++;
 		}
 	} else {
+		/* Special case 0 */
+		if (maxsplit == 0) {
+			krk_writeValueArray(AS_LIST(myList), argv[0]);
+			return krk_pop();
+		}
+
 		while (i != self->length) {
-			size_t stringCapacity = 0;
-			size_t stringLength   = 0;
-			char * stringBytes    = NULL;
-			while (i != self->length && !substringMatch(c, self->length - i, AS_STRING(argv[1])->chars, AS_STRING(argv[1])->length)) {
-				PUSH_CHAR(*c);
-				i++; c++;
+			struct StringBuilder sb = {0};
+			while (i != self->length && !substringMatch(c, self->length - i, sep, sepLen)) {
+				pushStringBuilder(&sb, *c);
+				i++;
+				c++;
 			}
-			KrkValue tmp = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
-			if (stringBytes) FREE_ARRAY(char,stringBytes,stringCapacity);
-			krk_push(tmp);
-			krk_writeValueArray(AS_LIST(myList), tmp);
+			krk_push(finishStringBuilder(&sb));
+			krk_writeValueArray(AS_LIST(myList), krk_peek(0));
 			krk_pop();
-			if (substringMatch(c, self->length - i, AS_STRING(argv[1])->chars, AS_STRING(argv[1])->length)) {
-				i += AS_STRING(argv[1])->length;
-				c += AS_STRING(argv[1])->length;
-				count++;
-				if (argc > 2 && count == (size_t)AS_INTEGER(argv[2])) {
-					size_t stringCapacity = 0;
-					size_t stringLength   = 0;
-					char * stringBytes    = NULL;
-					while (i != self->length) {
-						PUSH_CHAR(*c);
-						i++; c++;
-					}
-					KrkValue tmp = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
-					if (stringBytes) FREE_ARRAY(char,stringBytes,stringCapacity);
-					krk_push(tmp);
-					krk_writeValueArray(AS_LIST(myList), tmp);
-					krk_pop();
-					break;
-				}
-				if (i == self->length) {
-					KrkValue tmp = OBJECT_VAL(S(""));
-					krk_push(tmp);
-					krk_writeValueArray(AS_LIST(myList), tmp);
-					krk_pop();
-				}
+			if (i == self->length) break;
+			i += sepLen;
+			c += sepLen;
+			count++;
+			if (count == maxsplit || i == self->length) {
+				krk_push(OBJECT_VAL(krk_copyString(&self->chars[i], self->length - i)));
+				krk_writeValueArray(AS_LIST(myList), krk_peek(0));
+				krk_pop();
+				break;
 			}
 		}
 	}
 
-	krk_pop();
-	return myList;
-})
+	return krk_pop();
+}
 
-KRK_METHOD(str,replace,{
+KRK_Method(str,replace) {
 	METHOD_TAKES_AT_LEAST(2);
 	METHOD_TAKES_AT_MOST(3);
 	CHECK_ARG(1,str,KrkString*,oldStr);
 	CHECK_ARG(2,str,KrkString*,newStr);
 	KrkValue count = (argc > 3 && IS_INTEGER(argv[3])) ? argv[3] : NONE_VAL();
-	size_t stringCapacity = 0;
-	size_t stringLength   = 0;
-	char * stringBytes    = NULL;
+
+	struct StringBuilder sb = {0};
 
 	int replacements = 0;
 	size_t i = 0;
 	char * c = self->chars;
 	while (i < self->length) {
 		if ( substringMatch(c, self->length - i, oldStr->chars, oldStr->length) && (IS_NONE(count) || replacements < AS_INTEGER(count))) {
-			for (size_t j = 0; j < newStr->length; j++) {
-				PUSH_CHAR(newStr->chars[j]);
-			}
+			pushStringBuilderStr(&sb, newStr->chars, newStr->length);
 			if (oldStr->length == 0) {
-				PUSH_CHAR(*c);
+				pushStringBuilder(&sb, *c);
 				c++;
 				i++;
 			}
@@ -590,22 +750,21 @@ KRK_METHOD(str,replace,{
 			i += oldStr->length;
 			replacements++;
 		} else {
-			PUSH_CHAR(*c);
+			pushStringBuilder(&sb, *c);
 			c++;
 			i++;
 		}
 	}
-	KrkValue tmp = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
-	if (stringBytes) FREE_ARRAY(char,stringBytes,stringCapacity);
-	return tmp;
-})
+
+	return finishStringBuilder(&sb);
+}
 
 #define WRAP_INDEX(index) \
 	if (index < 0) index += self->codesLength; \
 	if (index < 0) index = 0; \
 	if (index >= (krk_integer_type)self->codesLength) index = self->codesLength
 
-KRK_METHOD(str,find,{
+KRK_Method(str,find) {
 	METHOD_TAKES_AT_LEAST(1);
 	METHOD_TAKES_AT_MOST(3);
 	CHECK_ARG(1,str,KrkString*,substr);
@@ -645,29 +804,29 @@ KRK_METHOD(str,find,{
 	}
 
 	return INTEGER_VAL(-1);
-})
+}
 
-KRK_METHOD(str,index,{
+KRK_Method(str,index) {
 	KrkValue result = FUNC_NAME(str,find)(argc,argv,hasKw);
 	if (IS_INTEGER(result) && AS_INTEGER(result) == -1) {
 		return krk_runtimeError(vm.exceptions->valueError, "substring not found");
 	}
 	return result;
-})
+}
 
-KRK_METHOD(str,startswith,{
+KRK_Method(str,startswith) {
 	METHOD_TAKES_EXACTLY(1); /* I know the Python versions of these take optional start, end... */
 	CHECK_ARG(1,str,KrkString*,prefix);
 	return BOOLEAN_VAL(substringMatch(self->chars,self->length,prefix->chars,prefix->length));
-})
+}
 
-KRK_METHOD(str,endswith,{
+KRK_Method(str,endswith) {
 	METHOD_TAKES_EXACTLY(1); /* I know the Python versions of these take optional start, end... */
 	CHECK_ARG(1,str,KrkString*,suffix);
 	if (suffix->length > self->length) return BOOLEAN_VAL(0);
 	return BOOLEAN_VAL(substringMatch(self->chars + (self->length - suffix->length),
 		suffix->length, suffix->chars, suffix->length));
-})
+}
 
 /**
  * str.__repr__()
@@ -675,12 +834,9 @@ KRK_METHOD(str,endswith,{
  * Strings are special because __str__ should do nothing but __repr__
  * should escape characters like quotes.
  */
-KRK_METHOD(str,__repr__,{
+KRK_Method(str,__repr__) {
 	METHOD_TAKES_NONE();
-	size_t stringCapacity = 0;
-	size_t stringLength   = 0;
-	char * stringBytes    = NULL;
-
+	struct StringBuilder sb = {0};
 	char * end = AS_CSTRING(argv[0]) + AS_STRING(argv[0])->length;
 
 	/* First count quotes */
@@ -693,53 +849,52 @@ KRK_METHOD(str,__repr__,{
 
 	char quote = (singles > doubles) ? '\"' : '\'';
 
-	PUSH_CHAR(quote);
+	pushStringBuilder(&sb, quote);
 
 	for (char * c = AS_CSTRING(argv[0]); c < end; ++c) {
 		switch (*c) {
 			/* XXX: Other non-printables should probably be escaped as well. */
-			case '\\': PUSH_CHAR('\\'); PUSH_CHAR('\\'); break;
-			case '\'': if (quote == *c) { PUSH_CHAR('\\'); } PUSH_CHAR('\''); break;
-			case '\"': if (quote == *c) { PUSH_CHAR('\\'); } PUSH_CHAR('\"'); break;
-			case '\a': PUSH_CHAR('\\'); PUSH_CHAR('a'); break;
-			case '\b': PUSH_CHAR('\\'); PUSH_CHAR('b'); break;
-			case '\f': PUSH_CHAR('\\'); PUSH_CHAR('f'); break;
-			case '\n': PUSH_CHAR('\\'); PUSH_CHAR('n'); break;
-			case '\r': PUSH_CHAR('\\'); PUSH_CHAR('r'); break;
-			case '\t': PUSH_CHAR('\\'); PUSH_CHAR('t'); break;
-			case '\v': PUSH_CHAR('\\'); PUSH_CHAR('v'); break;
-			case 27:   PUSH_CHAR('\\'); PUSH_CHAR('['); break;
+			case '\\': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'\\'); break;
+			case '\'': if (quote == *c) { pushStringBuilder(&sb,'\\'); } pushStringBuilder(&sb,'\''); break;
+			case '\"': if (quote == *c) { pushStringBuilder(&sb,'\\'); } pushStringBuilder(&sb,'\"'); break;
+			case '\a': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'a'); break;
+			case '\b': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'b'); break;
+			case '\f': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'f'); break;
+			case '\n': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'n'); break;
+			case '\r': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'r'); break;
+			case '\t': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'t'); break;
+			case '\v': pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'v'); break;
+			case 27:   pushStringBuilder(&sb,'\\'); pushStringBuilder(&sb,'['); break;
 			default: {
 				if ((unsigned char)*c < ' ' || (unsigned char)*c == 0x7F) {
-					PUSH_CHAR('\\');
-					PUSH_CHAR('x');
+					pushStringBuilder(&sb,'\\');
+					pushStringBuilder(&sb,'x');
 					char hex[3];
 					snprintf(hex, 3, "%02x", (unsigned char)*c);
-					PUSH_CHAR(hex[0]);
-					PUSH_CHAR(hex[1]);
+					pushStringBuilder(&sb,hex[0]);
+					pushStringBuilder(&sb,hex[1]);
 				} else {
-					PUSH_CHAR(*c);
+					pushStringBuilder(&sb,*c);
 				}
 				break;
 			}
 		}
 	}
 
-	PUSH_CHAR(quote);
-	KrkValue tmp = OBJECT_VAL(krk_copyString(stringBytes, stringLength));
-	if (stringBytes) FREE_ARRAY(char,stringBytes,stringCapacity);
-	return tmp;
-})
+	pushStringBuilder(&sb, quote);
 
-KRK_METHOD(str,encode,{
+	return finishStringBuilder(&sb);
+}
+
+KRK_Method(str,encode) {
 	METHOD_TAKES_NONE();
 	return OBJECT_VAL(krk_newBytes(AS_STRING(argv[0])->length, (uint8_t*)AS_CSTRING(argv[0])));
-})
+}
 
-KRK_METHOD(str,__str__,{
+KRK_Method(str,__str__) {
 	METHOD_TAKES_NONE();
 	return argv[0];
-})
+}
 
 void krk_addObjects(void) {
 	KrkValue tmp = FUNC_NAME(str,__add__)(2, (KrkValue[]){krk_peek(1), krk_peek(0)},0);
@@ -747,7 +902,7 @@ void krk_addObjects(void) {
 	krk_push(tmp);
 }
 
-KRK_METHOD(str,__iter__,{
+KRK_Method(str,__iter__) {
 	METHOD_TAKES_NONE();
 	KrkInstance * output = krk_newInstance(vm.baseClasses->striteratorClass);
 
@@ -756,7 +911,7 @@ KRK_METHOD(str,__iter__,{
 	krk_pop();
 
 	return OBJECT_VAL(output);
-})
+}
 
 #define CHECK_ALL(test) do { \
 	krk_unicodeString(self); \
@@ -765,35 +920,35 @@ KRK_METHOD(str,__iter__,{
 		if (!(test)) { return BOOLEAN_VAL(0); } \
 	} return BOOLEAN_VAL(1); } while (0)
 
-KRK_METHOD(str,isalnum,{
+KRK_Method(str,isalnum) {
 	CHECK_ALL( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') );
-})
+}
 
-KRK_METHOD(str,isalpha,{
+KRK_Method(str,isalpha) {
 	CHECK_ALL( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') );
-})
+}
 
-KRK_METHOD(str,isdigit,{
+KRK_Method(str,isdigit) {
 	CHECK_ALL( (c >= '0' && c <= '9') );
-})
+}
 
-KRK_METHOD(str,isxdigit,{
+KRK_Method(str,isxdigit) {
 	CHECK_ALL( (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f') || (c >= '0' && c <= '9') );
-})
+}
 
-KRK_METHOD(str,isspace, {
+KRK_Method(str,isspace) {
 	CHECK_ALL( (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v') );
-})
+}
 
-KRK_METHOD(str,islower, {
+KRK_Method(str,islower) {
 	CHECK_ALL( (c >= 'a' && c <= 'z') );
-})
+}
 
-KRK_METHOD(str,isupper, {
+KRK_Method(str,isupper)  {
 	CHECK_ALL( (c >= 'A' && c <= 'Z') );
-})
+}
 
-KRK_METHOD(str,lower, {
+KRK_Method(str,lower) {
 	METHOD_TAKES_NONE();
 	struct StringBuilder sb = {0};
 
@@ -806,9 +961,9 @@ KRK_METHOD(str,lower, {
 	}
 
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(str,upper, {
+KRK_Method(str,upper) {
 	METHOD_TAKES_NONE();
 	struct StringBuilder sb = {0};
 
@@ -821,9 +976,9 @@ KRK_METHOD(str,upper, {
 	}
 
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(str,title, {
+KRK_Method(str,title) {
 	METHOD_TAKES_NONE();
 	struct StringBuilder sb = {0};
 
@@ -843,29 +998,29 @@ KRK_METHOD(str,title, {
 	}
 
 	return finishStringBuilder(&sb);
-})
+}
 
 #undef CURRENT_CTYPE
 #define CURRENT_CTYPE KrkInstance *
-KRK_METHOD(striterator,__init__,{
+KRK_Method(striterator,__init__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,str,KrkString*,base);
 	krk_push(OBJECT_VAL(self));
 	krk_attachNamedObject(&self->fields, "s", (KrkObj*)base);
 	krk_attachNamedValue(&self->fields, "i", INTEGER_VAL(0));
 	return krk_pop();
-})
+}
 
-KRK_METHOD(striterator,__call__,{
+KRK_Method(striterator,__call__) {
 	METHOD_TAKES_NONE();
 	KrkValue _str;
 	KrkValue _counter;
 	const char * errorStr = NULL;
-	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("s")), &_str)) {
+	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("s")), &_str) || !IS_STRING(_str)) {
 		errorStr = "no str pointer";
 		goto _corrupt;
 	}
-	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("i")), &_counter)) {
+	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("i")), &_counter) || !IS_INTEGER(_counter)) {
 		errorStr = "no index";
 		goto _corrupt;
 	}
@@ -878,11 +1033,12 @@ KRK_METHOD(striterator,__call__,{
 	}
 _corrupt:
 	return krk_runtimeError(vm.exceptions->typeError, "Corrupt str iterator: %s", errorStr);
-})
+}
 
 _noexport
 void _createAndBind_strClass(void) {
 	KrkClass * str = ADD_BASE_CLASS(vm.baseClasses->strClass, "str", vm.baseClasses->objectClass);
+	str->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
 	BIND_METHOD(str,__init__);
 	BIND_METHOD(str,__iter__);
 	BIND_METHOD(str,__ord__);
@@ -903,6 +1059,7 @@ void _createAndBind_strClass(void) {
 	BIND_METHOD(str,__repr__);
 	BIND_METHOD(str,__str__);
 	BIND_METHOD(str,__hash__);
+	BIND_METHOD(str,__format__);
 	BIND_METHOD(str,encode);
 	BIND_METHOD(str,split);
 	BIND_METHOD(str,strip);
@@ -930,13 +1087,12 @@ void _createAndBind_strClass(void) {
 	BIND_METHOD(str,upper);
 	BIND_METHOD(str,title);
 
-	krk_defineNative(&str->methods,"__setslice__",FUNC_NAME(str,__setitem__));
-	krk_defineNative(&str->methods,"__delslice__",FUNC_NAME(str,__setitem__));
 	krk_defineNative(&str->methods,"__delitem__",FUNC_NAME(str,__setitem__));
 	krk_finalizeClass(str);
 	KRK_DOC(str, "Obtain a string representation of an object.");
 
 	KrkClass * striterator = ADD_BASE_CLASS(vm.baseClasses->striteratorClass, "striterator", vm.baseClasses->objectClass);
+	striterator->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
 	BIND_METHOD(striterator,__init__);
 	BIND_METHOD(striterator,__call__);
 	krk_finalizeClass(striterator);

@@ -13,7 +13,6 @@
 #include <kuroko/util.h>
 #include <kuroko/debug.h>
 
-static KrkClass * generator;
 /**
  * @brief Generator object implementation.
  * @extends KrkInstance
@@ -28,13 +27,24 @@ struct generator {
 	int started;
 	KrkValue result;
 	int type;
+	KrkThreadState fakethread;
+	KrkUpvalue * capturedUpvalues;
 };
 
 #define AS_generator(o) ((struct generator *)AS_OBJECT(o))
-#define IS_generator(o) (krk_isInstanceOf(o, generator))
+#define IS_generator(o) (krk_isInstanceOf(o, KRK_BASE_CLASS(generator)))
 
 #define CURRENT_CTYPE struct generator *
 #define CURRENT_NAME  self
+
+static void _generator_close_upvalues(struct generator * self) {
+	while (self->capturedUpvalues) {
+		KrkUpvalue * upvalue = self->capturedUpvalues;
+		upvalue->closed = self->args[upvalue->location];
+		upvalue->location = -1;
+		self->capturedUpvalues = upvalue->next;
+	}
+}
 
 static void _generator_gcscan(KrkInstance * _self) {
 	struct generator * self = (struct generator*)_self;
@@ -42,15 +52,20 @@ static void _generator_gcscan(KrkInstance * _self) {
 	for (size_t i = 0; i < self->argCount; ++i) {
 		krk_markValue(self->args[i]);
 	}
+	for (KrkUpvalue * upvalue = self->capturedUpvalues; upvalue; upvalue = upvalue->next) {
+		krk_markObject((KrkObj*)upvalue);
+	}
 	krk_markValue(self->result);
 }
 
 static void _generator_gcsweep(KrkInstance * self) {
+	_generator_close_upvalues((struct generator*)self);
 	free(((struct generator*)self)->args);
 }
 
 static void _set_generator_done(struct generator * self) {
 	self->ip = NULL;
+	_generator_close_upvalues(self);
 }
 
 /**
@@ -70,24 +85,28 @@ KrkInstance * krk_buildGenerator(KrkClosure * closure, KrkValue * argsIn, size_t
 	memcpy(args, argsIn, sizeof(KrkValue) * argCount);
 
 	/* Create a generator object */
-	struct generator * self = (struct generator *)krk_newInstance(generator);
+	struct generator * self = (struct generator *)krk_newInstance(KRK_BASE_CLASS(generator));
 	self->args = args;
 	self->argCount = argCount;
 	self->closure = closure;
 	self->ip = self->closure->function->chunk.code;
 	self->result = NONE_VAL();
-	self->type = closure->function->flags & (KRK_CODEOBJECT_FLAGS_IS_GENERATOR | KRK_CODEOBJECT_FLAGS_IS_COROUTINE);
+	self->type = closure->function->obj.flags & (KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR | KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE);
 	return (KrkInstance *)self;
 }
 
-KRK_METHOD(generator,__repr__,{
+FUNC_SIG(generator,__init__) {
+	return krk_runtimeError(vm.exceptions->typeError, "cannot create '%s' instances", "generator");
+}
+
+KRK_Method(generator,__repr__) {
 	METHOD_TAKES_NONE();
 
 	char * typeStr = "generator";
-	if (self->type == KRK_CODEOBJECT_FLAGS_IS_COROUTINE) {
+	if (self->type == KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE) {
 		/* Regular coroutine */
 		typeStr = "coroutine";
-	} else if (self->type == (KRK_CODEOBJECT_FLAGS_IS_COROUTINE | KRK_CODEOBJECT_FLAGS_IS_GENERATOR)) {
+	} else if (self->type == (KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE | KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR)) {
 		typeStr = "async_generator";
 	}
 
@@ -99,27 +118,41 @@ KRK_METHOD(generator,__repr__,{
 		(void*)self);
 
 	return OBJECT_VAL(krk_takeString(tmp,lenActual));
-})
+}
 
-KRK_METHOD(generator,__iter__,{
+KRK_Method(generator,__iter__) {
 	METHOD_TAKES_NONE();
 	return OBJECT_VAL(self);
-})
+}
 
-KRK_METHOD(generator,__call__,{
+KRK_Method(generator,__call__) {
 	METHOD_TAKES_AT_MOST(1);
 	if (!self->ip) return OBJECT_VAL(self);
+	if (self->running) {
+		return krk_runtimeError(vm.exceptions->valueError, "generator already executing");
+	}
 	/* Prepare frame */
 	KrkCallFrame * frame = &krk_currentThread.frames[krk_currentThread.frameCount++];
 	frame->closure = self->closure;
 	frame->ip      = self->ip;
 	frame->slots   = krk_currentThread.stackTop - krk_currentThread.stack;
 	frame->outSlots = frame->slots;
-	frame->globals = &self->closure->function->globalsContext->fields;
+	frame->globals = self->closure->globalsTable;
+	frame->globalsOwner = self->closure->globalsOwner;
 
 	/* Stick our stack on their stack */
 	for (size_t i = 0; i < self->argCount; ++i) {
 		krk_push(self->args[i]);
+	}
+
+	/* Point any of our captured upvalues back to their actual stack locations */
+	while (self->capturedUpvalues) {
+		KrkUpvalue * upvalue = self->capturedUpvalues;
+		upvalue->owner = &krk_currentThread;
+		upvalue->location = upvalue->location + frame->slots;
+		self->capturedUpvalues = upvalue->next;
+		upvalue->next = krk_currentThread.openUpvalues;
+		krk_currentThread.openUpvalues = upvalue;
 	}
 
 	if (self->started) {
@@ -153,6 +186,16 @@ KRK_METHOD(generator,__call__,{
 		return NONE_VAL();
 	}
 
+	/* Redirect any remaining upvalues captured from us, and release them from the VM */
+	while (krk_currentThread.openUpvalues != NULL && krk_currentThread.openUpvalues->location >= (int)frame->slots) {
+		KrkUpvalue * upvalue = krk_currentThread.openUpvalues;
+		upvalue->location = upvalue->location - frame->slots;
+		upvalue->owner = &self->fakethread;
+		krk_currentThread.openUpvalues = upvalue->next;
+		upvalue->next = self->capturedUpvalues;
+		self->capturedUpvalues = upvalue;
+	}
+
 	/* Determine the stack state */
 	if (stackAfter > stackBefore) {
 		size_t newArgs = stackAfter - stackBefore;
@@ -167,35 +210,36 @@ KRK_METHOD(generator,__call__,{
 	/* Save stack entries */
 	memcpy(self->args, krk_currentThread.stackTop - self->argCount, sizeof(KrkValue) * self->argCount);
 	self->ip      = frame->ip;
+	self->fakethread.stack = self->args;
 
 	krk_currentThread.stackTop = krk_currentThread.stack + frame->slots;
 
 	return result;
-})
+}
 
-KRK_METHOD(generator,send,{
+KRK_Method(generator,send) {
 	METHOD_TAKES_EXACTLY(1);
 	if (!self->started && !IS_NONE(argv[1])) {
 		return krk_runtimeError(vm.exceptions->typeError, "Can not send non-None value to just-started generator");
 	}
 	return FUNC_NAME(generator,__call__)(argc,argv,0);
-})
+}
 
-KRK_METHOD(generator,__finish__,{
+KRK_Method(generator,__finish__) {
 	METHOD_TAKES_NONE();
 	return self->result;
-})
+}
 
 /*
  * For compatibility with Python...
  */
-KRK_METHOD(generator,gi_running,{
+KRK_Method(generator,gi_running) {
 	METHOD_TAKES_NONE();
 	return BOOLEAN_VAL(self->running);
-})
+}
 
 int krk_getAwaitable(void) {
-	if (IS_generator(krk_peek(0)) && AS_generator(krk_peek(0))->type == KRK_CODEOBJECT_FLAGS_IS_COROUTINE) {
+	if (IS_generator(krk_peek(0)) && AS_generator(krk_peek(0))->type == KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE) {
 		/* Good to go */
 		return 1;
 	}
@@ -209,11 +253,11 @@ int krk_getAwaitable(void) {
 		krk_push(krk_callStack(0));
 		KrkClass * _type = krk_getType(krk_peek(0));
 		if (!_type || !_type->_iter) {
-			krk_runtimeError(vm.exceptions->attributeError, "__await__ returned non-iterator of type '%s'", krk_typeName(krk_peek(0)));
+			krk_runtimeError(vm.exceptions->attributeError, "__await__ returned non-iterator of type '%T'", krk_peek(0));
 			return 0;
 		}
 	} else {
-		krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not awaitable", krk_typeName(krk_peek(0)));
+		krk_runtimeError(vm.exceptions->attributeError, "'%T' object is not awaitable", krk_peek(0));
 		return 0;
 	}
 
@@ -222,10 +266,12 @@ int krk_getAwaitable(void) {
 
 _noexport
 void _createAndBind_generatorClass(void) {
-	generator = ADD_BASE_CLASS(vm.baseClasses->generatorClass, "generator", vm.baseClasses->objectClass);
+	KrkClass * generator = ADD_BASE_CLASS(vm.baseClasses->generatorClass, "generator", vm.baseClasses->objectClass);
 	generator->allocSize = sizeof(struct generator);
 	generator->_ongcscan = _generator_gcscan;
 	generator->_ongcsweep = _generator_gcsweep;
+	generator->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
+	BIND_METHOD(generator,__init__);
 	BIND_METHOD(generator,__iter__);
 	BIND_METHOD(generator,__call__);
 	BIND_METHOD(generator,__repr__);

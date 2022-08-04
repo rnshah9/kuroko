@@ -8,15 +8,6 @@
 #include "kuroko.h"
 
 /**
- * @brief Base structure of all heap objects.
- *
- * KrkObj is the base type of all objects stored on the heap and
- * managed by the garbage collector.
- */
-typedef struct KrkObj KrkObj;
-typedef struct KrkString KrkString;
-
-/**
  * @brief Tag enum for basic value types.
  *
  * These are the values stored in the upper NaN bits of
@@ -180,6 +171,18 @@ extern int krk_valuesEqual(KrkValue a, KrkValue b);
  */
 extern int krk_valuesSame(KrkValue a, KrkValue b);
 
+/**
+ * @brief Compare two values by identity, then by equality.
+ * @memberof KrkValue
+ *
+ * More efficient than just @c krk_valuesSame followed by @c krk_valuesEqual
+ *
+ * @return 1 if values represent the same object or value, 0 otherwise.
+ */
+extern int krk_valuesSameOrEqual(KrkValue a, KrkValue b);
+
+extern KrkValue krk_parse_int(const char * start, size_t width, unsigned int base);
+
 typedef union {
 	KrkValue val;
 	double   dbl;
@@ -211,25 +214,26 @@ typedef union {
  * is either an integer or a boolean - and booleans are also integers, so this
  * is how we check if something is an integer in the general case; for everything
  * else, we check against MASK_NONE because it sets all the identifying bits. */
-#define IS_INTEGER(value)   (((value) & KRK_VAL_MASK_HANDLER) == KRK_VAL_MASK_BOOLEAN)
-#define IS_BOOLEAN(value)   (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_BOOLEAN)
-#define IS_NONE(value)      (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_NONE)
-#define IS_HANDLER(value)   (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_HANDLER)
-#define IS_OBJECT(value)    (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_OBJECT)
-#define IS_KWARGS(value)    (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_KWARGS)
-#define IS_NOTIMPL(value)   (((value) & KRK_VAL_MASK_NONE) == KRK_VAL_MASK_NOTIMPL)
+#define IS_INTEGER(value)   ((((value) >> 48L) & (KRK_VAL_MASK_HANDLER >> 48L)) == (KRK_VAL_MASK_BOOLEAN >> 48L))
+#define IS_BOOLEAN(value)   (((value) >> 48L) == (KRK_VAL_MASK_BOOLEAN >> 48L))
+#define IS_NONE(value)      (((value) >> 48L) == (KRK_VAL_MASK_NONE    >> 48L))
+#define IS_HANDLER(value)   (((value) >> 48L) == (KRK_VAL_MASK_HANDLER >> 48L))
+#define IS_OBJECT(value)    (((value) >> 48L) == (KRK_VAL_MASK_OBJECT  >> 48L))
+#define IS_KWARGS(value)    (((value) >> 48L) == (KRK_VAL_MASK_KWARGS  >> 48L))
+#define IS_NOTIMPL(value)   (((value) >> 48L) == (KRK_VAL_MASK_NOTIMPL >> 48L))
 /* ... and as we said above, if any of the MASK_NAN bits are unset, it's a float. */
 #define IS_FLOATING(value)  (((value) & KRK_VAL_MASK_NAN) != KRK_VAL_MASK_NAN)
 
 #define AS_HANDLER_TYPE(value)    (AS_HANDLER(value) >> 16)
 #define AS_HANDLER_TARGET(value)  (AS_HANDLER(value) & 0xFFFF)
-#define IS_TRY_HANDLER(value)     (IS_HANDLER(value) && AS_HANDLER_TYPE(value) == OP_PUSH_TRY)
-#define IS_WITH_HANDLER(value)    (IS_HANDLER(value) && AS_HANDLER_TYPE(value) == OP_PUSH_WITH)
-#define IS_RAISE_HANDLER(value)   (IS_HANDLER(value) && AS_HANDLER_TYPE(value) == OP_RAISE)
-#define IS_EXCEPT_HANDLER(value)  (IS_HANDLER(value) && AS_HANDLER_TYPE(value) == OP_FILTER_EXCEPT)
+#define IS_HANDLER_TYPE(value,type) (IS_HANDLER(value) && AS_HANDLER_TYPE(value) == type)
 
 #define KWARGS_SINGLE (INT32_MAX)
 #define KWARGS_LIST   (INT32_MAX-1)
 #define KWARGS_DICT   (INT32_MAX-2)
 #define KWARGS_NIL    (INT32_MAX-3)
 #define KWARGS_UNSET  (0)
+
+#define PRIkrk_int "%" PRId64
+#define PRIkrk_hex "%" PRIx64
+

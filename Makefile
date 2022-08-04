@@ -28,6 +28,8 @@ ifeq (,$(findstring mingw,$(CC)))
   LIBRARY = libkuroko.so
   ifeq (Darwin,$(shell uname -s))
     MODLIBS += -undefined dynamic_lookup -DKRK_MEDIOCRE_TLS
+  else
+    ${TOOLS}: LDFLAGS += '-Wl,-rpath,$$ORIGIN'
   endif
 else
   CFLAGS  += -Wno-format -static-libgcc -pthread
@@ -105,6 +107,15 @@ libkuroko.dll: ${SOOBJS} ${HEADERS}
 
 libkuroko.a: ${OBJS}
 	${AR} ${ARFLAGS} $@ ${OBJS}
+
+
+src/chunk.o: src/opcodes.h
+src/compiler.o: src/opcodes.h
+src/debug.o: src/opcodes.h
+src/value.o: src/opcodes.h
+src/vm.o: src/opcodes.h
+src/exceptions.o: src/opcodes.h
+
 
 %.o: %.c ${HEADERS}
 	${CC} ${CFLAGS} -c -o $@ $<
@@ -219,8 +230,7 @@ deb: kuroko libkuroko.so
 		--license     "MIT" \
 		--category    "devel" \
 		-d            "libc6 (>= $(LIBCMIN))" \
-		--version     $(VERSION) \
-		--iteration   0 \
+		--version     $(shell ./kuroko tools/deb-ver.krk) \
 		--directories $(libdir)/kuroko
 	rm -r $(DESTDIR)
 

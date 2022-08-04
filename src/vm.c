@@ -15,28 +15,7 @@
 #include <kuroko/util.h>
 
 #include "private.h"
-
-#define KRK_VERSION_MAJOR  "1"
-#define KRK_VERSION_MINOR  "3"
-#define KRK_VERSION_PATCH  "0"
-
-#define KRK_VERSION_EXTRA_BASE  "-alpha"
-
-#ifndef STATIC_ONLY
-#define KRK_VERSION_EXTRA KRK_VERSION_EXTRA_BASE
-#else
-#define KRK_VERSION_EXTRA KRK_VERSION_EXTRA_BASE "-static"
-#endif
-
-#define KRK_BUILD_DATE     __DATE__ " at " __TIME__
-
-#if (defined(__GNUC__) || defined(__GNUG__)) && !(defined(__clang__) || defined(__INTEL_COMPILER))
-# define KRK_BUILD_COMPILER "GCC " __VERSION__
-#elif (defined(__clang__))
-# define KRK_BUILD_COMPILER "clang " __clang_version__
-#else
-# define KRK_BUILD_COMPILER ""
-#endif
+#include "opcode_enum.h"
 
 /* Ensure we don't have a macro for this so we can reference a local version. */
 #undef krk_currentThread
@@ -44,7 +23,7 @@
 /* This is macro'd to krk_vm for namespacing reasons. */
 KrkVM vm = {0};
 
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 /*
  * Marking our little VM thread state as 'initial-exec' is
  * the fastest way to allocate TLS data and yields virtually
@@ -62,7 +41,7 @@ __thread KrkThreadState krk_currentThread;
 KrkThreadState krk_currentThread;
 #endif
 
-#if defined(ENABLE_THREADING) && defined(__APPLE__) && defined(__aarch64__)
+#if !defined(KRK_DISABLE_THREADS) && defined(__APPLE__) && defined(__aarch64__)
 /**
  * I have not checked how this works on x86-64, so we only do this
  * on M1 Macs at the moment, but TLS is disastrously poorly implemented
@@ -88,28 +67,39 @@ void krk_forceThreadData(void) {
 #define krk_currentThread (*_macos_currentThread())
 #endif
 
-#if !defined(KRK_NO_TRACING) && !defined(__EMSCRIPTEN__)
-# define FRAME_IN(frame) if (vm.globalFlags & KRK_GLOBAL_CALLGRIND) { clock_gettime(CLOCK_MONOTONIC, &frame->in_time); }
-# define FRAME_OUT(frame) \
-	if (vm.globalFlags & KRK_GLOBAL_CALLGRIND && !(frame->closure->function->flags & KRK_CODEOBJECT_FLAGS_IS_GENERATOR)) { \
-		KrkCallFrame * caller = krk_currentThread.frameCount > 1 ? &krk_currentThread.frames[krk_currentThread.frameCount-2] : NULL; \
-		struct timespec outTime; \
-		clock_gettime(CLOCK_MONOTONIC, &outTime); \
-		struct timespec diff; \
-		diff.tv_sec  = outTime.tv_sec  - frame->in_time.tv_sec; \
-		diff.tv_nsec = outTime.tv_nsec - frame->in_time.tv_nsec; \
-		if (diff.tv_nsec < 0) { diff.tv_sec--; diff.tv_nsec += 1000000000L; } \
-		fprintf(vm.callgrindFile, "%s %s@%p %d %s %s@%p %d %lld.%.9ld\n", \
-			caller ? (caller->closure->function->chunk.filename->chars) : "stdin", \
-			caller ? (caller->closure->function->qualname ? caller->closure->function->qualname->chars : caller->closure->function->name->chars) : "(root)", \
-			caller ? ((void*)caller->closure->function) : NULL, \
-			caller ? ((int)krk_lineNumber(&caller->closure->function->chunk, caller->ip - caller->closure->function->chunk.code)) : 1, \
-			frame->closure->function->chunk.filename->chars, \
-			frame->closure->function->qualname ? frame->closure->function->qualname->chars : frame->closure->function->name->chars, \
-			(void*)frame->closure->function, \
-			(int)krk_lineNumber(&frame->closure->function->chunk, 0), \
-			(long long)diff.tv_sec, diff.tv_nsec); \
+#if !defined(KRK_NO_TRACING) && !defined(__EMSCRIPTEN__) && !defined(KRK_NO_CALLGRIND)
+static void _frame_in(KrkCallFrame * frame) {
+	 clock_gettime(CLOCK_MONOTONIC, &frame->in_time);
+}
+static void _frame_out(KrkCallFrame * frame) {
+	if (frame->closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR) return;
+
+	KrkCallFrame * caller = krk_currentThread.frameCount > 1 ? &krk_currentThread.frames[krk_currentThread.frameCount-2] : NULL;
+
+	struct timespec outTime, diff;
+
+	clock_gettime(CLOCK_MONOTONIC, &outTime);
+	diff.tv_sec  = outTime.tv_sec  - frame->in_time.tv_sec;
+	diff.tv_nsec = outTime.tv_nsec - frame->in_time.tv_nsec;
+
+	if (diff.tv_nsec < 0) {
+		diff.tv_sec--;
+		diff.tv_nsec += 1000000000L;
 	}
+
+	fprintf(vm.callgrindFile, "%s %s@%p %d %s %s@%p %d %lld.%.9ld\n",
+		caller ? (caller->closure->function->chunk.filename->chars) : "stdin",
+		caller ? (caller->closure->function->qualname ? caller->closure->function->qualname->chars : caller->closure->function->name->chars) : "(root)",
+		caller ? ((void*)caller->closure->function) : NULL,
+		caller ? ((int)krk_lineNumber(&caller->closure->function->chunk, caller->ip - caller->closure->function->chunk.code)) : 1,
+		frame->closure->function->chunk.filename->chars,
+		frame->closure->function->qualname ? frame->closure->function->qualname->chars : frame->closure->function->name->chars,
+		(void*)frame->closure->function,
+		(int)krk_lineNumber(&frame->closure->function->chunk, 0),
+		(long long)diff.tv_sec, diff.tv_nsec);
+}
+# define FRAME_IN(frame) if (unlikely(vm.globalFlags & KRK_GLOBAL_CALLGRIND)) { _frame_in(frame); }
+# define FRAME_OUT(frame) if (unlikely(vm.globalFlags & KRK_GLOBAL_CALLGRIND)) { _frame_out(frame); }
 #else
 # define FRAME_IN(frame)
 # define FRAME_OUT(frame)
@@ -126,10 +116,6 @@ KrkThreadState * krk_getCurrentThread(void) {
 	return &krk_currentThread;
 }
 
-static struct Exceptions _exceptions = {0};
-static struct BaseClasses _baseClasses = {0};
-static KrkValue _specialMethodNames[METHOD__MAX];
-
 /**
  * Reset the stack pointers, frame, upvalue list,
  * clear the exception flag and current exception;
@@ -142,156 +128,6 @@ void krk_resetStack(void) {
 	krk_currentThread.openUpvalues = NULL;
 	krk_currentThread.flags &= ~KRK_THREAD_HAS_EXCEPTION;
 	krk_currentThread.currentException = NONE_VAL();
-}
-
-/**
- * Display a traceback by scanning up the stack / call frames.
- * The format of the output here is modeled after the output
- * given by CPython, so we display the outermost call first
- * and then move inwards; on each call frame we try to open
- * the source file and print the corresponding line.
- */
-void krk_dumpTraceback(void) {
-	if (!krk_valuesEqual(krk_currentThread.currentException,NONE_VAL())) {
-		krk_push(krk_currentThread.currentException);
-		KrkValue tracebackEntries;
-		if (IS_INSTANCE(krk_currentThread.currentException)
-			&& krk_tableGet(&AS_INSTANCE(krk_currentThread.currentException)->fields, OBJECT_VAL(S("traceback")), &tracebackEntries)
-			&& IS_list(tracebackEntries) && AS_LIST(tracebackEntries)->count > 0) {
-			/* This exception has a traceback we can print. */
-			fprintf(stderr, "Traceback (most recent call last):\n");
-			for (size_t i = 0; i < AS_LIST(tracebackEntries)->count; ++i) {
-
-				/* Quietly skip invalid entries as we don't want to bother printing explanatory text for them */
-				if (!IS_TUPLE(AS_LIST(tracebackEntries)->values[i])) continue;
-				KrkTuple * entry = AS_TUPLE(AS_LIST(tracebackEntries)->values[i]);
-				if (entry->values.count != 2) continue;
-				if (!IS_CLOSURE(entry->values.values[0])) continue;
-				if (!IS_INTEGER(entry->values.values[1])) continue;
-
-				/* Get the function and instruction index from this traceback entry */
-				KrkClosure * closure = AS_CLOSURE(entry->values.values[0]);
-				KrkCodeObject * function = closure->function;
-				size_t instruction = AS_INTEGER(entry->values.values[1]);
-
-				/* Calculate the line number */
-				int lineNo = (int)krk_lineNumber(&function->chunk, instruction);
-
-				/* Print the simple stuff that we already know */
-				fprintf(stderr, "  File \"%s\", line %d, in %s\n",
-					(function->chunk.filename ? function->chunk.filename->chars : "?"),
-					lineNo,
-					(function->name ? function->name->chars : "(unnamed)"));
-
-#ifndef NO_SOURCE_IN_TRACEBACK
-				/* Try to open the file */
-				if (function->chunk.filename) {
-					FILE * f = fopen(function->chunk.filename->chars, "r");
-					if (f) {
-						int line = 1;
-						do {
-							int c = fgetc(f);
-							if (c < -1) break;
-							if (c == '\n') {
-								line++;
-								continue;
-							}
-							if (line == lineNo) {
-								fprintf(stderr,"    ");
-								while (c == ' ') c = fgetc(f);
-								do {
-									fputc(c, stderr);
-									c = fgetc(f);
-								} while (!feof(f) && c > 0 && c != '\n');
-								fprintf(stderr, "\n");
-								break;
-							}
-						} while (!feof(f));
-						fclose(f);
-					}
-				}
-#endif
-			}
-		}
-
-		/* Is this a SyntaxError? Handle those specially. */
-		if (krk_isInstanceOf(krk_currentThread.currentException, vm.exceptions->syntaxError)) {
-			KrkValue result = krk_callDirect(krk_getType(krk_currentThread.currentException)->_tostr, 1);
-			fprintf(stderr, "%s\n", AS_CSTRING(result));
-			return;
-		}
-		/* Clear the exception state while printing the exception. */
-		krk_currentThread.flags &= ~(KRK_THREAD_HAS_EXCEPTION);
-		fprintf(stderr, "%s", krk_typeName(krk_currentThread.currentException));
-		KrkValue result = krk_callDirect(krk_getType(krk_currentThread.currentException)->_tostr, 1);
-		if (!IS_STRING(result)) {
-			fprintf(stderr, "\n");
-		} else {
-			fprintf(stderr, ": %s\n", AS_CSTRING(result));
-		}
-		/* Turn the exception flag back on */
-		krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
-	}
-}
-
-/**
- * Attach a traceback to the current exception object, if it doesn't already have one.
- */
-static void attachTraceback(void) {
-	if (IS_INSTANCE(krk_currentThread.currentException)) {
-		KrkInstance * theException = AS_INSTANCE(krk_currentThread.currentException);
-
-		/* If there already is a traceback, don't add a new one; this exception was re-raised. */
-		KrkValue existing;
-		if (krk_tableGet(&theException->fields, OBJECT_VAL(S("traceback")), &existing)) return;
-
-		KrkValue tracebackList = krk_list_of(0,NULL,0);
-		krk_push(tracebackList);
-		/* Build the traceback object */
-		if (krk_currentThread.frameCount) {
-			for (size_t i = 0; i < krk_currentThread.frameCount; i++) {
-				KrkCallFrame * frame = &krk_currentThread.frames[i];
-				KrkTuple * tbEntry = krk_newTuple(2);
-				krk_push(OBJECT_VAL(tbEntry));
-				tbEntry->values.values[tbEntry->values.count++] = OBJECT_VAL(frame->closure);
-				tbEntry->values.values[tbEntry->values.count++] = INTEGER_VAL(frame->ip - frame->closure->function->chunk.code - 1);
-				krk_writeValueArray(AS_LIST(tracebackList), OBJECT_VAL(tbEntry));
-				krk_pop();
-			}
-		}
-		krk_attachNamedValue(&theException->fields, "traceback", tracebackList);
-		krk_pop();
-	} /* else: probably a legacy 'raise str', just don't bother. */
-}
-
-/**
- * Raise an exception. Creates an exception object of the requested type
- * and formats a message string to attach to it. Exception classes are
- * found in vm.exceptions and are initialized on startup.
- */
-KrkValue krk_runtimeError(KrkClass * type, const char * fmt, ...) {
-	char buf[1024] = {0};
-	va_list args;
-	va_start(args, fmt);
-	size_t len = vsnprintf(buf, 1024, fmt, args);
-	va_end(args);
-	krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
-
-	/* Allocate an exception object of the requested type. */
-	KrkInstance * exceptionObject = krk_newInstance(type);
-	krk_push(OBJECT_VAL(exceptionObject));
-	krk_push(OBJECT_VAL(S("arg")));
-	krk_push(OBJECT_VAL(krk_copyString(buf, len)));
-	/* Attach its argument */
-	krk_tableSet(&exceptionObject->fields, krk_peek(1), krk_peek(0));
-	krk_pop();
-	krk_pop();
-	krk_pop();
-
-	/* Set the current exception to be picked up by handleException */
-	krk_currentThread.currentException = OBJECT_VAL(exceptionObject);
-	attachTraceback();
-	return NONE_VAL();
 }
 
 void krk_growStack(void) {
@@ -362,22 +198,6 @@ KrkNative * krk_defineNative(KrkTable * table, const char * name, NativeFn funct
 }
 
 /**
- * Create a new property object that calls a C function; same semantics as defineNative, but
- * instead of applying the function directly it is applied as a property value, so it should
- * be used with the "fields" table rather than the methods table. This will eventually replace
- * the ":field" option for defineNative().
- */
-KrkNative * krk_defineNativeProperty(KrkTable * table, const char * name, NativeFn function) {
-	KrkNative * func = krk_newNative(function, name, 0);
-	krk_push(OBJECT_VAL(func));
-	KrkInstance * property = krk_newInstance(vm.baseClasses->propertyClass);
-	krk_attachNamedObject(table, name, (KrkObj*)property);
-	krk_attachNamedObject(&property->fields, "fget", (KrkObj*)func);
-	krk_pop();
-	return func;
-}
-
-/**
  * Shortcut for building classes.
  */
 KrkClass * krk_makeClass(KrkInstance * module, KrkClass ** _class, const char * name, KrkClass * base) {
@@ -413,27 +233,15 @@ void krk_finalizeClass(KrkClass * _class) {
 		KrkSpecialMethods index;
 	};
 	struct TypeMap specials[] = {
-		{&_class->_getter, METHOD_GET},
-		{&_class->_setter, METHOD_SET},
-		{&_class->_reprer, METHOD_REPR},
-		{&_class->_tostr, METHOD_STR},
-		{&_class->_call, METHOD_CALL},
-		{&_class->_init, METHOD_INIT},
-		{&_class->_eq, METHOD_EQ},
-		{&_class->_len, METHOD_LEN},
-		{&_class->_enter, METHOD_ENTER},
-		{&_class->_exit, METHOD_EXIT},
-		{&_class->_delitem, METHOD_DELITEM},
-		{&_class->_iter, METHOD_ITER},
-		{&_class->_getattr, METHOD_GETATTR},
-		{&_class->_dir, METHOD_DIR},
-		{&_class->_contains, METHOD_CONTAINS},
-		{&_class->_descget, METHOD_DESCGET},
-		{&_class->_descset, METHOD_DESCSET},
-		{&_class->_classgetitem, METHOD_CLASSGETITEM},
-		{&_class->_hash, METHOD_HASH},
+	#define CACHED_METHOD(a,b,c) {&_class-> c, METHOD_ ## a},
+	#define SPECIAL_ATTRS(a,b)
+	#include "methods.h"
+	#undef CACHED_METHOD
+	#undef SPECIAL_ATTRS
 		{NULL, 0},
 	};
+
+	_class->cacheIndex = 0;
 
 	for (struct TypeMap * entry = specials; entry->method; ++entry) {
 		*entry->method = NULL;
@@ -442,7 +250,7 @@ void krk_finalizeClass(KrkClass * _class) {
 			if (krk_tableGet(&_base->methods, vm.specialMethodNames[entry->index], &tmp)) break;
 			_base = _base->base;
 		}
-		if (_base && (IS_CLOSURE(tmp) || IS_NATIVE(tmp))) {
+		if (_base && (IS_CLOSURE(tmp) || IS_NATIVE(tmp)) && !(AS_OBJECT(tmp)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD)) {
 			*entry->method = AS_OBJECT(tmp);
 		}
 	}
@@ -458,6 +266,50 @@ void krk_finalizeClass(KrkClass * _class) {
 		if (IS_KWARGS(entry->key)) continue;
 		krk_finalizeClass(AS_CLASS(entry->key));
 	}
+}
+
+/**
+ * This should really be the default behavior of type.__new__?
+ */
+static void _callSetName(KrkClass * _class) {
+	KrkValue setnames = krk_list_of(0,NULL,0);
+	krk_push(setnames);
+	extern FUNC_SIG(list,append);
+
+	/* The semantics of this require that we first collect all of the relevant items... */
+	for (size_t i = 0; i < _class->methods.capacity; ++i) {
+		KrkTableEntry * entry = &_class->methods.entries[i];
+		if (!IS_KWARGS(entry->key)) {
+			KrkClass * type = krk_getType(entry->value);
+			if (type->_set_name) {
+				FUNC_NAME(list,append)(2,(KrkValue[]){setnames,entry->key},0);
+				FUNC_NAME(list,append)(2,(KrkValue[]){setnames,entry->value},0);
+			}
+		}
+	}
+
+	/* Then call __set_name__ on them */
+	for (size_t i = 0; i < AS_LIST(setnames)->count; i += 2) {
+		KrkValue name = AS_LIST(setnames)->values[i];
+		KrkValue value = AS_LIST(setnames)->values[i+1];
+		KrkClass * type = krk_getType(value);
+		if (type->_set_name) {
+			krk_push(value);
+			krk_push(OBJECT_VAL(_class));
+			krk_push(name);
+			krk_callDirect(type->_set_name, 3);
+
+			/* If any of these raises an exception, bail; CPython raises
+			 * an outer exception, setting the cause, but I'm being lazy
+			 * at the moment... */
+			if (unlikely(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) {
+				break;
+			}
+		}
+	}
+
+	/* List used to store name+value pairs */
+	krk_pop();
 }
 
 /**
@@ -530,48 +382,60 @@ static inline int checkArgumentCount(const KrkClosure * closure, int argCount) {
 }
 
 static void multipleDefs(const KrkClosure * closure, int destination) {
-	krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%s'",
+	krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%S'",
 		closure->function->name ? closure->function->name->chars : "<unnamed>",
-		(destination < closure->function->requiredArgs ? AS_CSTRING(closure->function->requiredArgNames.values[destination]) :
-			(destination - closure->function->requiredArgs < closure->function->keywordArgs ? AS_CSTRING(closure->function->keywordArgNames.values[destination - closure->function->requiredArgs]) :
-				"<unnamed>")));
+		(destination < closure->function->requiredArgs ? AS_STRING(closure->function->requiredArgNames.values[destination]) :
+			(destination - closure->function->requiredArgs < closure->function->keywordArgs ? AS_STRING(closure->function->keywordArgNames.values[destination - closure->function->requiredArgs]) :
+				S("<unnamed>"))));
 }
 
-#undef unpackError
-#define unpackError(fromInput) return krk_runtimeError(vm.exceptions->typeError, "Can not unpack *expression: '%s' object is not iterable", krk_typeName(fromInput)), 0;
-#define unpackArray(counter, indexer) do { \
-	if (positionals->count + counter > positionals->capacity) { \
-		size_t old = positionals->capacity; \
-		positionals->capacity = positionals->count + counter; \
-		positionals->values = GROW_ARRAY(KrkValue,positionals->values,old,positionals->capacity); \
-	} \
-	for (size_t i = 0; i < counter; ++i) { \
-		positionals->values[positionals->count] = indexer; \
-		positionals->count++; \
-	} \
-} while (0)
-int krk_processComplexArguments(int argCount, KrkValueArray * positionals, KrkTable * keywords, const char * name) {
-	size_t kwargsCount = AS_INTEGER(krk_currentThread.stackTop[-1]);
-	krk_pop(); /* Pop the arg counter */
-	argCount--;
+static int _unpack_op(void * context, const KrkValue * values, size_t count) {
+	KrkTuple * output = context;
+	if (unlikely(output->values.count + count > output->values.capacity)) {
+		krk_runtimeError(vm.exceptions->valueError, "too many values to unpack (expected %zu)",
+			output->values.capacity);
+		return 1;
+	}
+	for (size_t i = 0; i < count; ++i) {
+		output->values.values[output->values.count++] = values[i];
+	}
+	return 0;
+}
 
-	krk_initValueArray(positionals);
-	krk_initTable(keywords);
+static int _unpack_args(void * context, const KrkValue * values, size_t count) {
+	KrkValueArray * positionals = context;
+	if (positionals->count + count > positionals->capacity) {
+		size_t old = positionals->capacity;
+		positionals->capacity = (count == 1) ? GROW_CAPACITY(old) : (positionals->count + count);
+		positionals->values = GROW_ARRAY(KrkValue, positionals->values, old, positionals->capacity);
+	}
+
+	for (size_t i = 0; i < count; ++i) {
+		positionals->values[positionals->count++] = values[i];
+	}
+
+	return 0;
+}
+
+int krk_processComplexArguments(int argCount, KrkValueArray * positionals, KrkTable * keywords, const char * name) {
+#define TOP_ARGS 3
+	size_t kwargsCount = AS_INTEGER(krk_currentThread.stackTop[-TOP_ARGS]);
+	argCount--;
 
 	/* First, process all the positionals, including any from extractions. */
 	size_t existingPositionalArgs = argCount - kwargsCount * 2;
 	for (size_t i = 0; i < existingPositionalArgs; ++i) {
-		krk_writeValueArray(positionals, krk_currentThread.stackTop[-argCount + i]);
+		krk_writeValueArray(positionals, krk_currentThread.stackTop[-argCount + i - TOP_ARGS]);
 	}
 
-	KrkValue * startOfExtras = &krk_currentThread.stackTop[-kwargsCount * 2];
+	KrkValue * startOfExtras = &krk_currentThread.stackTop[-kwargsCount * 2 - TOP_ARGS];
 	/* Now unpack everything else. */
 	for (size_t i = 0; i < kwargsCount; ++i) {
 		KrkValue key = startOfExtras[i*2];
 		KrkValue value = startOfExtras[i*2 + 1];
 		if (IS_KWARGS(key)) {
 			if (AS_INTEGER(key) == KWARGS_LIST) { /* unpack list */
-				unpackIterableFast(value);
+				if (krk_unpackIterable(value,positionals,_unpack_args)) return 0;
 			} else if (AS_INTEGER(key) == KWARGS_DICT) { /* unpack dict */
 				if (!IS_dict(value)) {
 					krk_runtimeError(vm.exceptions->typeError, "%s(): **expression value is not a dict.", name);
@@ -585,7 +449,7 @@ int krk_processComplexArguments(int argCount, KrkValueArray * positionals, KrkTa
 							return 0;
 						}
 						if (!krk_tableSet(keywords, entry->key, entry->value)) {
-							krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%s'", name, AS_CSTRING(entry->key));
+							krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%S'", name, AS_STRING(entry->key));
 							return 0;
 						}
 					}
@@ -595,14 +459,13 @@ int krk_processComplexArguments(int argCount, KrkValueArray * positionals, KrkTa
 			}
 		} else if (IS_STRING(key)) {
 			if (!krk_tableSet(keywords, key, value)) {
-				krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%s'", name, AS_CSTRING(key));
+				krk_runtimeError(vm.exceptions->typeError, "%s() got multiple values for argument '%S'", name, AS_STRING(key));
 				return 0;
 			}
 		}
 	}
 	return 1;
 }
-#undef unpackArray
 
 /**
  * Call a managed method.
@@ -614,29 +477,42 @@ int krk_processComplexArguments(int argCount, KrkValueArray * positionals, KrkTa
  * `extra` is passed by `callValue` to tell us which case we have, and thus
  * where we need to restore the stack to when we return from this call.
  */
-static int call(KrkClosure * closure, int argCount, int returnDepth) {
-	size_t potentialPositionalArgs = closure->function->requiredArgs + closure->function->keywordArgs;
-	size_t totalArguments = closure->function->requiredArgs + closure->function->keywordArgs + !!(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) + !!(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS);
-	size_t offsetOfExtraArgs = closure->function->requiredArgs + closure->function->keywordArgs;
+static inline int _callManaged(KrkClosure * closure, int argCount, int returnDepth) {
+	size_t potentialPositionalArgs = closure->function->potentialPositionals;
+	size_t totalArguments = closure->function->totalArguments;
+	size_t offsetOfExtraArgs = potentialPositionalArgs;
 	size_t argCountX = argCount;
-	KrkValueArray * positionals;
-	KrkTable * keywords;
 
-	if (argCount && IS_KWARGS(krk_currentThread.stackTop[-1])) {
+	if (argCount && unlikely(IS_KWARGS(krk_currentThread.stackTop[-1]))) {
 
 		KrkValue myList = krk_list_of(0,NULL,0);
-		krk_currentThread.scratchSpace[0] = myList;
-		KrkValue myDict = krk_dict_of(0,NULL,0);
-		krk_currentThread.scratchSpace[1] = myDict;
+		krk_push(myList);
+		KrkValueArray * positionals;
 		positionals = AS_LIST(myList);
+
+		KrkValue myDict = krk_dict_of(0,NULL,0);
+		krk_push(myDict);
+		KrkTable * keywords;
 		keywords = AS_DICT(myDict);
 
 		/* This processes the existing argument list into a ValueArray and a Table with the args and keywords */
-		if (!krk_processComplexArguments(argCount, positionals, keywords, closure->function->name ? closure->function->name->chars : "<unnamed>")) goto _errorDuringPositionals;
-		argCount--; /* It popped the KWARGS value from the top, so we have one less argument */
+		if (!krk_processComplexArguments(argCount, positionals, keywords, closure->function->name ? closure->function->name->chars : "<unnamed>")) return 0;
+
+		/* Store scratch while we adjust; we can not make calls while using these scratch
+		 * registers as they may be clobbered by a nested call to _callManaged. */
+		krk_currentThread.scratchSpace[0] = myList;
+		krk_currentThread.scratchSpace[1] = myList;
+
+		/* Pop three things, including the kwargs count */
+		krk_pop(); /* dict */
+		krk_pop(); /* list */
+		krk_pop(); /* kwargs */
+
+		/* We popped the kwargs sentinel, which counted for one argCount */
+		argCount--;
 
 		/* Do we already know we have too many arguments? Let's bail before doing a bunch of work. */
-		if ((positionals->count > potentialPositionalArgs) && !(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS)) {
+		if ((positionals->count > potentialPositionalArgs) && !(closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS)) {
 			checkArgumentCount(closure,positionals->count);
 			goto _errorDuringPositionals;
 		}
@@ -663,14 +539,14 @@ static int call(KrkClosure * closure, int argCount, int returnDepth) {
 			krk_currentThread.stackTop[-argCount + i] = positionals->values[i];
 		}
 
-		if (closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) {
+		if (closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) {
 			size_t count  = (positionals->count > potentialPositionalArgs) ? (positionals->count - potentialPositionalArgs) : 0;
 			KrkValue * offset = (count == 0) ? NULL : &positionals->values[potentialPositionalArgs];
 			krk_push(krk_list_of(count, offset, 0));
 			argCount++;
 		}
 
-		krk_freeValueArray(positionals);
+		/* We're done with the positionals */
 		krk_currentThread.scratchSpace[0] = NONE_VAL();
 
 		/* Now place keyword arguments */
@@ -701,10 +577,10 @@ static int call(KrkClosure * closure, int argCount, int returnDepth) {
 						goto _finishKwarg;
 					}
 				}
-				if (!(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS)) {
-					krk_runtimeError(vm.exceptions->typeError, "%s() got an unexpected keyword argument '%s'",
+				if (!(closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS)) {
+					krk_runtimeError(vm.exceptions->typeError, "%s() got an unexpected keyword argument '%S'",
 						closure->function->name ? closure->function->name->chars : "<unnamed>",
-						AS_CSTRING(name));
+						AS_STRING(name));
 					goto _errorAfterPositionals;
 				}
 				continue;
@@ -716,33 +592,32 @@ _finishKwarg:
 		}
 
 		/* If this function takes a **kwargs, we need to provide it as a dict */
-		if (closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS) {
+		if (closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS) {
 			krk_push(krk_dict_of(0,NULL,0));
 			argCount++;
 			krk_tableAddAll(keywords, AS_DICT(krk_peek(0)));
 		}
 
-		krk_freeTable(keywords);
+		/* We're done with the keywords */
 		krk_currentThread.scratchSpace[1] = NONE_VAL();
 
 		for (size_t i = 0; i < (size_t)closure->function->requiredArgs; ++i) {
 			if (IS_KWARGS(krk_currentThread.stackTop[-argCount + i])) {
-				krk_runtimeError(vm.exceptions->typeError, "%s() missing required positional argument: '%s'",
+				krk_runtimeError(vm.exceptions->typeError, "%s() missing required positional argument: '%S'",
 					closure->function->name ? closure->function->name->chars : "<unnamed>",
-					AS_CSTRING(closure->function->requiredArgNames.values[i]));
+					AS_STRING(closure->function->requiredArgNames.values[i]));
 				goto _errorAfterKeywords;
 			}
 		}
 
-		argCountX = argCount - (!!(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) + !!(closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS));
-	} else if ((size_t)argCount > potentialPositionalArgs && (closure->function->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS)) {
-		krk_push(NONE_VAL()); krk_push(NONE_VAL()); krk_pop(); krk_pop();
+		argCountX = argCount - (!!(closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) + !!(closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS));
+	} else if ((size_t)argCount > potentialPositionalArgs && (closure->function->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS)) {
 		KrkValue * startOfPositionals = &krk_currentThread.stackTop[-argCount];
-		KrkValue tmp = krk_list_of(argCount - potentialPositionalArgs,
-			&startOfPositionals[potentialPositionalArgs], 0);
+		KrkValue tmp = krk_callNativeOnStack(argCount - potentialPositionalArgs,
+			&startOfPositionals[potentialPositionalArgs], 0, krk_list_of);
 		startOfPositionals = &krk_currentThread.stackTop[-argCount];
 		startOfPositionals[offsetOfExtraArgs] = tmp;
-		argCount = closure->function->requiredArgs + 1;
+		argCount = potentialPositionalArgs + 1;
 		argCountX = argCount - 1;
 		while (krk_currentThread.stackTop > startOfPositionals + argCount) krk_pop();
 	}
@@ -754,7 +629,7 @@ _finishKwarg:
 		argCount++;
 	}
 
-	if (unlikely(closure->function->flags & (KRK_CODEOBJECT_FLAGS_IS_GENERATOR | KRK_CODEOBJECT_FLAGS_IS_COROUTINE))) {
+	if (unlikely(closure->function->obj.flags & (KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR | KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE))) {
 		KrkInstance * gen = krk_buildGenerator(closure, krk_currentThread.stackTop - argCount, argCount);
 		krk_currentThread.stackTop = krk_currentThread.stackTop - argCount - returnDepth;
 		krk_push(OBJECT_VAL(gen));
@@ -770,16 +645,15 @@ _finishKwarg:
 	frame->closure = closure;
 	frame->ip = closure->function->chunk.code;
 	frame->slots = (krk_currentThread.stackTop - argCount) - krk_currentThread.stack;
-	frame->outSlots = (krk_currentThread.stackTop - argCount - returnDepth) - krk_currentThread.stack;
-	frame->globals = &closure->function->globalsContext->fields;
+	frame->outSlots = frame->slots - returnDepth;
+	frame->globalsOwner = closure->globalsOwner;
+	frame->globals = closure->globalsTable;
 	FRAME_IN(frame);
 	return 1;
 
 _errorDuringPositionals:
-	krk_freeValueArray(positionals);
 	krk_currentThread.scratchSpace[0] = NONE_VAL();
 _errorAfterPositionals:
-	krk_freeTable(keywords);
 	krk_currentThread.scratchSpace[1] = NONE_VAL();
 _errorAfterKeywords:
 	return 0;
@@ -790,7 +664,7 @@ _errorAfterKeywords:
  * If the stack is reallocated within this call, the old stack will not be freed until
  * all such nested calls through krk_callNativeOnStack have returned.
  */
-KrkValue krk_callNativeOnStack(NativeFn native, size_t argCount, KrkValue *stackArgs, int hasKw) {
+inline KrkValue krk_callNativeOnStack(size_t argCount, const KrkValue *stackArgs, int hasKw, NativeFn native) {
 
 	/**
 	 * If someone is already preserving this stack, we can just call directly.
@@ -801,8 +675,8 @@ KrkValue krk_callNativeOnStack(NativeFn native, size_t argCount, KrkValue *stack
 
 	/* Mark the thread's stack as preserved. */
 	krk_currentThread.flags |= KRK_THREAD_DEFER_STACK_FREE;
-	void * stackBefore = krk_currentThread.stack;
 	size_t sizeBefore  = krk_currentThread.stackSize;
+	void * stackBefore = krk_currentThread.stack;
 	KrkValue result = native(argCount, stackArgs, hasKw);
 
 	if (unlikely(krk_currentThread.stack != stackBefore)) {
@@ -811,6 +685,49 @@ KrkValue krk_callNativeOnStack(NativeFn native, size_t argCount, KrkValue *stack
 
 	krk_currentThread.flags &= ~(KRK_THREAD_DEFER_STACK_FREE);
 	return result;
+}
+
+/**
+ * Sometimes we might call something with a bound receiver, which in most circumstances
+ * can replace the called object on the stack, but sometimes we don't _have_ the called
+ * object on the stack - only its arguments. If that is the case, we unfortunately need
+ * to rotate the stack so we can inject the implicit bound argument at the front.
+ */
+static void _rotate(size_t argCount) {
+	krk_push(NONE_VAL());
+	memmove(&krk_currentThread.stackTop[-argCount],&krk_currentThread.stackTop[-argCount-1],sizeof(KrkValue) * argCount);
+}
+
+static inline int _callNative(KrkNative* callee, int argCount, int returnDepth) {
+	NativeFn native = (NativeFn)callee->function;
+	size_t stackOffsetAfterCall = (krk_currentThread.stackTop - krk_currentThread.stack) - argCount - returnDepth;
+	KrkValue result;
+	if (unlikely(argCount && IS_KWARGS(krk_currentThread.stackTop[-1]))) {
+		/* Prep space for our list + dictionary */
+		KrkValue myList = krk_list_of(0,NULL,0);
+		krk_push(myList);
+		KrkValue myDict = krk_dict_of(0,NULL,0);
+		krk_push(myDict);
+
+		/* Parse kwargs stuff into the list+dict; note, this no longer pops anything, and expects
+		 * our list + dict to be at the top: [kwargs] [list] [dict] */
+		if (unlikely(!krk_processComplexArguments(argCount, AS_LIST(myList), AS_DICT(myDict), callee->name))) return 0;
+
+		/* Write the dict into the list */
+		krk_writeValueArray(AS_LIST(myList), myDict);
+
+		/* Reduce the stack to just the list */
+		krk_currentThread.stack[stackOffsetAfterCall] = myList;
+		krk_currentThread.stackTop = &krk_currentThread.stack[stackOffsetAfterCall+1];
+
+		/* Call with list as arguments */
+		result = native(AS_LIST(myList)->count-1, AS_LIST(myList)->values, 1);
+	} else {
+		result = krk_callNativeOnStack(argCount, krk_currentThread.stackTop - argCount, 0, native);
+	}
+	krk_currentThread.stackTop = &krk_currentThread.stack[stackOffsetAfterCall];
+	krk_push(result);
+	return 2;
 }
 
 /**
@@ -836,73 +753,48 @@ int krk_callValue(KrkValue callee, int argCount, int returnDepth) {
 	if (likely(IS_OBJECT(callee))) {
 		_innerObject:
 		switch (OBJECT_TYPE(callee)) {
-			case KRK_OBJ_CLOSURE:
-				return call(AS_CLOSURE(callee), argCount, returnDepth);
-			case KRK_OBJ_NATIVE: {
-				NativeFn native = (NativeFn)AS_NATIVE(callee)->function;
-				if (unlikely(argCount && IS_KWARGS(krk_currentThread.stackTop[-1]))) {
-					KrkValue myList = krk_list_of(0,NULL,0);
-					krk_currentThread.scratchSpace[0] = myList;
-					KrkValue myDict = krk_dict_of(0,NULL,0);
-					krk_currentThread.scratchSpace[1] = myDict;
-					if (unlikely(!krk_processComplexArguments(argCount, AS_LIST(myList), AS_DICT(myDict), AS_NATIVE(callee)->name))) {
-						return 0;
-					}
-					argCount--; /* Because that popped the kwargs value */
-					krk_currentThread.stackTop -= argCount + returnDepth; /* We can just put the stack back to normal */
-					krk_push(myList);
-					krk_push(myDict);
-					krk_currentThread.scratchSpace[0] = NONE_VAL();
-					krk_currentThread.scratchSpace[1] = NONE_VAL();
-					krk_writeValueArray(AS_LIST(myList), myDict);
-					KrkValue result = native(AS_LIST(myList)->count-1, AS_LIST(myList)->values, 1);
-					if (unlikely(krk_currentThread.stackTop == krk_currentThread.stack)) return 0;
-					krk_pop();
-					krk_pop();
-					krk_push(result);
-				} else {
-					KrkValue result = krk_callNativeOnStack(native, argCount, krk_currentThread.stackTop - argCount, 0);
-					if (unlikely(krk_currentThread.stackTop == krk_currentThread.stack)) return 0;
-					krk_currentThread.stackTop -= argCount + returnDepth;
-					krk_push(result);
-				}
-				return 2;
-			}
+			case KRK_OBJ_CLOSURE: return _callManaged(AS_CLOSURE(callee), argCount, returnDepth);
+			case KRK_OBJ_NATIVE: return _callNative(AS_NATIVE(callee), argCount, returnDepth);
 			case KRK_OBJ_INSTANCE: {
 				KrkClass * _class = AS_INSTANCE(callee)->_class;
 				if (likely(_class->_call != NULL)) {
-					callee = OBJECT_VAL(_class->_call);
+					if (unlikely(returnDepth == 0)) _rotate(argCount);
+					krk_currentThread.stackTop[-argCount - 1] = callee;
 					argCount++;
 					returnDepth = returnDepth ? (returnDepth - 1) : 0;
-					goto _innerObject;
+					return (_class->_call->type == KRK_OBJ_CLOSURE) ? _callManaged((KrkClosure*)_class->_call, argCount, returnDepth) : _callNative((KrkNative*)_class->_call, argCount, returnDepth);
 				} else {
-					krk_runtimeError(vm.exceptions->typeError, "'%s' object is not callable", krk_typeName(callee));
+					krk_runtimeError(vm.exceptions->typeError, "'%T' object is not callable", callee);
 					return 0;
 				}
 			}
 			case KRK_OBJ_CLASS: {
 				KrkClass * _class = AS_CLASS(callee);
 				KrkInstance * newInstance = krk_newInstance(_class);
-				krk_currentThread.stackTop[-argCount - 1] = OBJECT_VAL(newInstance);
 				if (likely(_class->_init != NULL)) {
+					if (unlikely(returnDepth == 0)) _rotate(argCount);
+					krk_currentThread.stackTop[-argCount - 1] = OBJECT_VAL(newInstance);
 					callee = OBJECT_VAL(_class->_init);
 					argCount++;
 					returnDepth = returnDepth ? (returnDepth - 1) : 0;
 					goto _innerObject;
 				} else if (unlikely(argCount != 0)) {
-					krk_runtimeError(vm.exceptions->typeError, "%s() takes no arguments (%d given)",
-						_class->name->chars, argCount);
+					krk_runtimeError(vm.exceptions->typeError, "%S() takes no arguments (%d given)",
+						_class->name, argCount);
 					return 0;
 				}
-				return 1;
+				krk_currentThread.stackTop -= argCount + returnDepth;
+				krk_push(OBJECT_VAL(newInstance));
+				return 2;
 			}
 			case KRK_OBJ_BOUND_METHOD: {
 				KrkBoundMethod * bound = AS_BOUND_METHOD(callee);
-				krk_currentThread.stackTop[-argCount - 1] = bound->receiver;
 				if (unlikely(!bound->method)) {
 					krk_runtimeError(vm.exceptions->argumentError, "???");
 					return 0;
 				}
+				if (unlikely(returnDepth == 0)) _rotate(argCount);
+				krk_currentThread.stackTop[-argCount - 1] = bound->receiver;
 				callee = OBJECT_VAL(bound->method);
 				argCount++;
 				returnDepth = returnDepth ? (returnDepth - 1) : 0;
@@ -912,7 +804,7 @@ int krk_callValue(KrkValue callee, int argCount, int returnDepth) {
 				break;
 		}
 	}
-	krk_runtimeError(vm.exceptions->typeError, "'%s' object is not callable", krk_typeName(callee));
+	krk_runtimeError(vm.exceptions->typeError, "'%T' object is not callable", callee);
 	return 0;
 }
 
@@ -928,116 +820,16 @@ KrkValue krk_callStack(int argCount) {
 }
 
 KrkValue krk_callDirect(KrkObj * callable, int argCount) {
-	if (unlikely(callable->type != KRK_OBJ_CLOSURE && callable->type != KRK_OBJ_NATIVE)) {
-		return krk_runtimeError(vm.exceptions->typeError, "'%s' is not a function.", krk_typeName(OBJECT_VAL(callable)));
+	int result = 0;
+	switch (callable->type) {
+		case KRK_OBJ_CLOSURE: result = _callManaged((KrkClosure*)callable, argCount, 0); break;
+		case KRK_OBJ_NATIVE: result = _callNative((KrkNative*)callable, argCount, 0); break;
+		default: __builtin_unreachable();
 	}
-	switch (krk_callValue(OBJECT_VAL(callable), argCount, 0)) {
-		case 2: return krk_pop();
-		case 1: return krk_runNext();
-		default: return NONE_VAL();
-	}
+	if (likely(result == 2)) return krk_pop();
+	else if (result == 1) return krk_runNext();
+	return NONE_VAL();
 }
-
-/**
- * Attach a method call to its callee and return a BoundMethod.
- * Works for managed and native method calls.
- */
-int krk_bindMethod(KrkClass * _class, KrkString * name) {
-	KrkClass * originalClass = _class;
-	KrkValue method, out;
-	while (_class) {
-		if (krk_tableGet_fast(&_class->methods, name, &method)) break;
-		_class = _class->base;
-	}
-	if (!_class) return 0;
-	if (IS_NATIVE(method)) {
-		if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY) {
-			out = AS_NATIVE(method)->function(1, (KrkValue[]){krk_peek(0)}, 0);
-		} else if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_CLASS_METHOD) {
-			out = OBJECT_VAL(krk_newBoundMethod(OBJECT_VAL(originalClass), AS_OBJECT(method)));
-		} else if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_STATIC_METHOD) {
-			out = method;
-		} else {
-			out = OBJECT_VAL(krk_newBoundMethod(krk_peek(0), AS_OBJECT(method)));
-		}
-	} else if (IS_CLOSURE(method)) {
-		if (AS_CLOSURE(method)->flags & KRK_FUNCTION_FLAGS_IS_CLASS_METHOD) {
-			out = OBJECT_VAL(krk_newBoundMethod(OBJECT_VAL(originalClass), AS_OBJECT(method)));
-		} else if (AS_CLOSURE(method)->flags & KRK_FUNCTION_FLAGS_IS_STATIC_METHOD) {
-			out = method;
-		} else {
-			out = OBJECT_VAL(krk_newBoundMethod(krk_peek(0), AS_OBJECT(method)));
-		}
-	} else {
-		/* Does it have a descriptor __get__? */
-		KrkClass * type = krk_getType(method);
-		if (type->_descget) {
-			krk_push(method);
-			krk_swap(1);
-			krk_push(krk_callDirect(type->_descget, 2));
-			return 1;
-		}
-		out = method;
-	}
-	krk_pop();
-	krk_push(out);
-	return 1;
-}
-
-/**
- * Similar to @ref krk_bindMethod but does not create bound method objects.
- * @returns 1 if the result was an (unbound) method, 2 if it was something else, 0 if it was not found.
- */
-int krk_unbindMethod(KrkClass * _class, KrkString * name) {
-	KrkClass * originalClass = _class;
-	KrkValue method, out;
-	while (_class) {
-		if (krk_tableGet_fast(&_class->methods, name, &method)) break;
-		_class = _class->base;
-	}
-	if (!_class) return 0;
-	if (IS_NATIVE(method)) {
-		if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY) {
-			out = AS_NATIVE(method)->function(1, (KrkValue[]){krk_peek(0)}, 0);
-		} else if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_CLASS_METHOD) {
-			krk_pop(); /* the object */
-			krk_push(OBJECT_VAL(originalClass));
-			krk_push(method);
-			return 1;
-		} else if (((KrkNative*)AS_OBJECT(method))->flags & KRK_NATIVE_FLAGS_IS_STATIC_METHOD) {
-			out = method;
-		} else {
-			krk_push(method);
-			return 1;
-		}
-	} else if (IS_CLOSURE(method)) {
-		if (AS_CLOSURE(method)->flags & KRK_FUNCTION_FLAGS_IS_CLASS_METHOD) {
-			krk_pop();
-			krk_push(OBJECT_VAL(originalClass));
-			krk_push(method);
-			return 1;
-		} else if (AS_CLOSURE(method)->flags & KRK_FUNCTION_FLAGS_IS_STATIC_METHOD) {
-			out = method;
-		} else {
-			krk_push(method);
-			return 1;
-		}
-	} else {
-		/* Does it have a descriptor __get__? */
-		KrkClass * type = krk_getType(method);
-		if (type->_descget) {
-			krk_push(krk_peek(0));
-			krk_push(method);
-			krk_swap(1);
-			krk_push(krk_callDirect(type->_descget, 2));
-			return 2;
-		}
-		out = method;
-	}
-	krk_push(out);
-	return 2;
-}
-
 
 /**
  * Capture upvalues and mark them as open. Called upon closure creation to
@@ -1099,7 +891,6 @@ void krk_attachNamedObject(KrkTable * table, const char name[], KrkObj * obj) {
 	krk_attachNamedValue(table,name,OBJECT_VAL(obj));
 }
 
-
 /**
  * Inverse of truthiness.
  *
@@ -1138,125 +929,6 @@ int krk_isFalsey(KrkValue value) {
 	return 0; /* Assume anything else is truthy */
 }
 
-#ifndef KRK_DISABLE_DEBUG
-KRK_FUNC(set_tracing,{
-	if (hasKw) {
-		KrkValue test;
-		if (krk_tableGet(AS_DICT(argv[argc]), OBJECT_VAL(S("tracing")), &test) && IS_INTEGER(test)) {
-			if (AS_INTEGER(test) == 1) krk_currentThread.flags |= KRK_THREAD_ENABLE_TRACING; else krk_currentThread.flags &= ~KRK_THREAD_ENABLE_TRACING; }
-		if (krk_tableGet(AS_DICT(argv[argc]), OBJECT_VAL(S("disassembly")), &test) && IS_INTEGER(test)) {
-			if (AS_INTEGER(test) == 1) krk_currentThread.flags |= KRK_THREAD_ENABLE_DISASSEMBLY; else krk_currentThread.flags &= ~KRK_THREAD_ENABLE_DISASSEMBLY; }
-		if (krk_tableGet(AS_DICT(argv[argc]), OBJECT_VAL(S("scantracing")), &test) && IS_INTEGER(test)) {
-			if (AS_INTEGER(test) == 1) krk_currentThread.flags |= KRK_THREAD_ENABLE_SCAN_TRACING; else krk_currentThread.flags &= ~KRK_THREAD_ENABLE_SCAN_TRACING; }
-
-		if (krk_tableGet(AS_DICT(argv[argc]), OBJECT_VAL(S("stressgc")), &test) && IS_INTEGER(test)) {
-			if (AS_INTEGER(test) == 1) vm.globalFlags |= KRK_GLOBAL_ENABLE_STRESS_GC; else krk_currentThread.flags &= ~KRK_GLOBAL_ENABLE_STRESS_GC; }
-	}
-	return BOOLEAN_VAL(1);
-})
-#else
-KRK_FUNC(set_tracing,{
-	return krk_runtimeError(vm.exceptions->typeError,"Debugging is not enabled in this build.");
-})
-#endif
-
-KRK_FUNC(getsizeof,{
-	if (argc < 1) return INTEGER_VAL(0);
-	if (!IS_OBJECT(argv[0])) return INTEGER_VAL(sizeof(KrkValue));
-	size_t mySize = sizeof(KrkValue);
-	switch (AS_OBJECT(argv[0])->type) {
-		case KRK_OBJ_STRING: {
-			KrkString * self = AS_STRING(argv[0]);
-			mySize += sizeof(KrkString) + self->length /* For the UTF8 */
-			+ ((self->codes && (self->chars != self->codes)) ? (self->type * self->codesLength) : 0);
-			break;
-		}
-		case KRK_OBJ_BYTES: {
-			KrkBytes * self = AS_BYTES(argv[0]);
-			mySize += sizeof(KrkBytes) + self->length;
-			break;
-		}
-		case KRK_OBJ_INSTANCE: {
-			KrkInstance * self = AS_INSTANCE(argv[0]);
-			mySize += sizeof(KrkTableEntry) * self->fields.capacity;
-			KrkClass * type = krk_getType(argv[0]);
-			if (type->allocSize) {
-				mySize += type->allocSize;
-			} else {
-				mySize += sizeof(KrkInstance);
-			}
-			if (krk_isInstanceOf(argv[0], vm.baseClasses->listClass)) {
-				mySize += sizeof(KrkValue) * AS_LIST(argv[0])->capacity;
-			} else if (krk_isInstanceOf(argv[0], vm.baseClasses->dictClass)) {
-				mySize += sizeof(KrkTableEntry) * AS_DICT(argv[0])->capacity;
-			}
-			break;
-		}
-		case KRK_OBJ_CLASS: {
-			KrkClass * self = AS_CLASS(argv[0]);
-			mySize += sizeof(KrkClass) + sizeof(KrkTableEntry) * self->methods.capacity;
-			break;
-		}
-		case KRK_OBJ_NATIVE: {
-			KrkNative * self = (KrkNative*)AS_OBJECT(argv[0]);
-			mySize += sizeof(KrkNative) + strlen(self->name) + 1;
-			break;
-		}
-		case KRK_OBJ_TUPLE: {
-			KrkTuple * self = AS_TUPLE(argv[0]);
-			mySize += sizeof(KrkTuple) + sizeof(KrkValue) * self->values.capacity;
-			break;
-		}
-		case KRK_OBJ_BOUND_METHOD: {
-			mySize += sizeof(KrkBoundMethod);
-			break;
-		}
-		case KRK_OBJ_CLOSURE: {
-			KrkClosure * self = AS_CLOSURE(argv[0]);
-			mySize += sizeof(KrkClosure) + sizeof(KrkUpvalue*) * self->function->upvalueCount;
-			break;
-		}
-		default: break;
-	}
-	return INTEGER_VAL(mySize);
-})
-
-KRK_FUNC(set_clean_output,{
-	if (!argc || (IS_BOOLEAN(argv[0]) && AS_BOOLEAN(argv[0]))) {
-		vm.globalFlags |= KRK_GLOBAL_CLEAN_OUTPUT;
-	} else {
-		vm.globalFlags &= ~KRK_GLOBAL_CLEAN_OUTPUT;
-	}
-	return NONE_VAL();
-})
-
-KRK_FUNC(importmodule,{
-	FUNCTION_TAKES_EXACTLY(1);
-	if (!IS_STRING(argv[0])) return TYPE_ERROR(str,argv[0]);
-	if (!krk_doRecursiveModuleLoad(AS_STRING(argv[0]))) return NONE_VAL(); /* ImportError already raised */
-	return krk_pop();
-})
-
-KRK_FUNC(modules,{
-	FUNCTION_TAKES_NONE();
-	KrkValue moduleList = krk_list_of(0,NULL,0);
-	krk_push(moduleList);
-	for (size_t i = 0; i < vm.modules.capacity; ++i) {
-		KrkTableEntry * entry = &vm.modules.entries[i];
-		if (IS_KWARGS(entry->key)) continue;
-		krk_writeValueArray(AS_LIST(moduleList), entry->key);
-	}
-	return krk_pop();
-})
-
-KRK_FUNC(unload,{
-	FUNCTION_TAKES_EXACTLY(1);
-	if (!IS_STRING(argv[0])) return TYPE_ERROR(str,argv[0]);
-	if (!krk_tableDelete(&vm.modules, argv[0])) {
-		return krk_runtimeError(vm.exceptions->keyError, "Module is not loaded.");
-	}
-})
-
 void krk_setMaximumRecursionDepth(size_t maxDepth) {
 	vm.maximumCallDepth = maxDepth;
 
@@ -1268,7 +940,7 @@ void krk_setMaximumRecursionDepth(size_t maxDepth) {
 }
 
 void krk_initVM(int flags) {
-#if defined(ENABLE_THREADING) && defined(__APPLE__) && defined(__aarch64__)
+#if !defined(KRK_DISABLE_THREADS) && defined(__APPLE__) && defined(__aarch64__)
 	krk_forceThreadData();
 #endif
 
@@ -1292,9 +964,9 @@ void krk_initVM(int flags) {
 	vm.grayStack = NULL;
 
 	/* Global objects */
-	vm.exceptions = &_exceptions;
-	vm.baseClasses = &_baseClasses;
-	vm.specialMethodNames = _specialMethodNames;
+	vm.exceptions = calloc(1,sizeof(struct Exceptions));
+	vm.baseClasses = calloc(1,sizeof(struct BaseClasses));
+	vm.specialMethodNames = calloc(METHOD__MAX,sizeof(KrkValue));
 	krk_initTable(&vm.strings);
 	krk_initTable(&vm.modules);
 
@@ -1303,47 +975,11 @@ void krk_initVM(int flags) {
 	 * and unboxing, copying/hashing etc.
 	 */
 	struct { const char * s; size_t len; } _methods[] = {
-	#define _(m,s) [m] = {s,sizeof(s)-1}
-		_(METHOD_INIT, "__init__"),
-		/* String conversion */
-		_(METHOD_STR, "__str__"),
-		_(METHOD_REPR, "__repr__"),
-		/* Subscripting / Indexing */
-		_(METHOD_LEN, "__len__"),
-		_(METHOD_GET, "__getitem__"),
-		_(METHOD_SET, "__setitem__"),
-		_(METHOD_DELITEM, "__delitem__"),
-		/* Dynamic properties */
-		_(METHOD_CLASS, "__class__"),
-		_(METHOD_NAME, "__name__"),
-		_(METHOD_FILE, "__file__"),
-		_(METHOD_DOC, "__doc__"),
-		_(METHOD_BASE, "__base__"),
-		/* Numeric conversions */
-		_(METHOD_INT, "__int__"),
-		_(METHOD_CHR, "__chr__"),
-		_(METHOD_ORD, "__ord__"),
-		_(METHOD_FLOAT, "__float__"),
-		/* General overridable methods */
-		_(METHOD_CALL, "__call__"),
-		_(METHOD_EQ, "__eq__"),
-		/* Iterables */
-		_(METHOD_ITER, "__iter__"),
-		_(METHOD_CONTAINS, "__contains__"),
-		/* Context managers */
-		_(METHOD_ENTER, "__enter__"),
-		_(METHOD_EXIT, "__exit__"),
-		/* Attribute access */
-		_(METHOD_GETATTR, "__getattr__"),
-		_(METHOD_DIR, "__dir__"),
-		/* Descriptor methods */
-		_(METHOD_DESCGET, "__get__"),
-		_(METHOD_DESCSET, "__set__"),
-		/* Very special thing */
-		_(METHOD_CLASSGETITEM, "__class_getitem__"),
-		/* Hashing override */
-		_(METHOD_HASH, "__hash__"),
-	#undef _
+	#define CACHED_METHOD(a,b,c) [METHOD_ ## a] = {b,sizeof(b)-1},
+	#define SPECIAL_ATTRS(a,b)   [METHOD_ ## a] = {b,sizeof(b)-1},
+	#include "methods.h"
+	#undef CACHED_METHOD
+	#undef SPECIAL_ATTRS
 	};
 	for (size_t i = 0; i < METHOD__MAX; ++i) {
 		vm.specialMethodNames[i] = OBJECT_VAL(krk_copyString(_methods[i].s, _methods[i].len));
@@ -1364,94 +1000,25 @@ void krk_initVM(int flags) {
 	_createAndBind_sliceClass();
 	_createAndBind_exceptions();
 	_createAndBind_generatorClass();
-	_createAndBind_gcMod();
-	_createAndBind_timeMod();
-	_createAndBind_osMod();
-	_createAndBind_fileioMod();
-#ifndef KRK_DISABLE_DEBUG
-	_createAndBind_disMod();
-#endif
-#ifdef ENABLE_THREADING
-	_createAndBind_threadsMod();
-#endif
+	_createAndBind_longClass();
+	_createAndBind_compilerClass();
 
-	/**
-	 * kuroko = module()
-	 *
-	 * This is equivalent to Python's "sys" module, but we do not use that name
-	 * in consideration of future compatibility, where a "sys" module may be
-	 * added to emulate Python version numbers, etc.
-	 */
-	vm.system = krk_newInstance(vm.baseClasses->moduleClass);
-	krk_attachNamedObject(&vm.modules, "kuroko", (KrkObj*)vm.system);
-	krk_attachNamedObject(&vm.system->fields, "__name__", (KrkObj*)S("kuroko"));
-	krk_attachNamedValue(&vm.system->fields, "__file__", NONE_VAL()); /* (built-in) */
-	KRK_DOC(vm.system, "@brief System module.");
-	krk_attachNamedObject(&vm.system->fields, "version",
-		(KrkObj*)S(KRK_VERSION_MAJOR "." KRK_VERSION_MINOR "." KRK_VERSION_PATCH KRK_VERSION_EXTRA));
-	krk_attachNamedObject(&vm.system->fields, "buildenv", (KrkObj*)S(KRK_BUILD_COMPILER));
-	krk_attachNamedObject(&vm.system->fields, "builddate", (KrkObj*)S(KRK_BUILD_DATE));
-	KRK_DOC(BIND_FUNC(vm.system,getsizeof),
-		"@brief Calculate the approximate size of an object in bytes.\n"
-		"@arguments value\n\n"
-		"@param value Value to examine.");
-	KRK_DOC(BIND_FUNC(vm.system,set_clean_output),
-		"@brief Disables terminal escapes in some output from the VM.\n"
-		"@arguments clean=True\n\n"
-		"@param clean Whether to remove escapes.");
-	KRK_DOC(BIND_FUNC(vm.system,set_tracing),
-		"@brief Toggle debugging modes.\n"
-		"@arguments tracing=None,disassembly=None,scantracing=None,stressgc=None\n\n"
-		"Enables or disables tracing options for the current thread.\n\n"
-		"@param tracing Enables instruction tracing.\n"
-		"@param disassembly Prints bytecode disassembly after compilation.\n"
-		"@param scantracing Prints debug output from the token scanner during compilation.\n"
-		"@param stressgc Forces a garbage collection cycle on each heap allocation.");
-	KRK_DOC(BIND_FUNC(vm.system,importmodule),
-		"@brief Import a module by string name\n"
-		"@arguments module\n\n"
-		"Imports the dot-separated module @p module as if it were imported by the @c import statement and returns the resulting module object.\n\n"
-		"@param module A string with a dot-separated package or module name");
-	KRK_DOC(BIND_FUNC(vm.system,modules),
-		"Get the list of valid names from the module table");
-	KRK_DOC(BIND_FUNC(vm.system,unload),
-		"Removes a module from the module table. It is not necessarily garbage collected if other references to it exist.");
-	krk_attachNamedObject(&vm.system->fields, "module", (KrkObj*)vm.baseClasses->moduleClass);
-	krk_attachNamedObject(&vm.system->fields, "path_sep", (KrkObj*)S(PATH_SEP));
-	KrkValue module_paths = krk_list_of(0,NULL,0);
-	krk_attachNamedValue(&vm.system->fields, "module_paths", module_paths);
-	krk_writeValueArray(AS_LIST(module_paths), OBJECT_VAL(S("./")));
-#ifndef NO_FILESYSTEM
-	if (vm.binpath) {
-		krk_attachNamedObject(&vm.system->fields, "executable_path", (KrkObj*)krk_copyString(vm.binpath, strlen(vm.binpath)));
-		char * dir = strdup(vm.binpath);
-#ifndef _WIN32
-		char * slash = strrchr(dir,'/');
-		if (slash) *slash = '\0';
-		if (strstr(dir,"/bin") == (dir + strlen(dir) - 4)) {
-			slash = strrchr(dir,'/');
-			if (slash) *slash = '\0';
-			size_t allocSize = sizeof("/lib/kuroko/") + strlen(dir);
-			char * out = malloc(allocSize);
-			size_t len = snprintf(out, allocSize, "%s/lib/kuroko/", dir);
-			krk_writeValueArray(AS_LIST(module_paths), OBJECT_VAL(krk_takeString(out, len)));
-		} else {
-			size_t allocSize = sizeof("/modules/") + strlen(dir);
-			char * out = malloc(allocSize);
-			size_t len = snprintf(out, allocSize, "%s/modules/", dir);
-			krk_writeValueArray(AS_LIST(module_paths), OBJECT_VAL(krk_takeString(out, len)));
-		}
-#else
-		char * backslash = strrchr(dir,'\\');
-		if (backslash) *backslash = '\0';
-		size_t allocSize = sizeof("\\modules\\") + strlen(dir);
-		char * out = malloc(allocSize);
-		size_t len = snprintf(out, allocSize, "%s\\modules\\", dir);
-		krk_writeValueArray(AS_LIST(module_paths), OBJECT_VAL(krk_takeString(out,len)));
+	if (!(vm.globalFlags & KRK_GLOBAL_NO_DEFAULT_MODULES)) {
+#ifndef KRK_NO_SYSTEM_MODULES
+		krk_module_init_kuroko();
+		krk_module_init_gc();
+		krk_module_init_time();
+		krk_module_init_os();
+		krk_module_init_fileio();
 #endif
-		free(dir);
+#ifndef KRK_DISABLE_DEBUG
+		krk_module_init_dis();
+#endif
+#ifndef KRK_DISABLE_THREADS
+		krk_module_init_threading();
+#endif
 	}
-#endif
+
 
 	/* The VM is now ready to start executing code. */
 	krk_resetStack();
@@ -1463,12 +1030,13 @@ void krk_initVM(int flags) {
 void krk_freeVM() {
 	krk_freeTable(&vm.strings);
 	krk_freeTable(&vm.modules);
-	memset(_specialMethodNames,0,sizeof(_specialMethodNames));
-	memset(&_exceptions,0,sizeof(_exceptions));
-	memset(&_baseClasses,0,sizeof(_baseClasses));
+	if (vm.specialMethodNames) free(vm.specialMethodNames);
+	if (vm.exceptions) free(vm.exceptions);
+	if (vm.baseClasses) free(vm.baseClasses);
 	krk_freeObjects();
 
 	if (vm.binpath) free(vm.binpath);
+	if (vm.dbgState) free(vm.dbgState);
 
 	while (krk_currentThread.next) {
 		KrkThreadState * thread = krk_currentThread.next;
@@ -1494,155 +1062,92 @@ const char * krk_typeName(KrkValue value) {
 	return krk_getType(value)->name->chars;
 }
 
-static KrkValue tryBind(const char * name, KrkValue a, KrkValue b, const char * operator, const char * inverse) {
-	krk_currentThread.scratchSpace[0] = a;
-	krk_currentThread.scratchSpace[1] = b;
-
-	/* Potential return value */
-	KrkValue value = NONE_VAL();
-	KrkString * methodName = krk_copyString(name, strlen(name));
-	krk_push(OBJECT_VAL(methodName));
-
-	/* Bind from a */
-	int res;
-	KrkClass * type = krk_getType(a);
-	krk_push(a);
-	if ((res = krk_unbindMethod(type, methodName))) {
-		krk_swap(1);
-		if (res == 2) {
-			krk_pop();
-		}
-		krk_push(b);
-		value = krk_callStack(res == 2 ? 1 : 2);
-		if (!IS_NOTIMPL(value)) goto _success;
-		krk_pop(); /* name */
-	} else {
-		krk_pop(); /* a */
-		krk_pop(); /* name */
-	}
-
-	/* Bind from b */
-	methodName = krk_copyString(inverse, strlen(inverse));
-	krk_push(OBJECT_VAL(methodName));
-	type = krk_getType(b);
-	krk_push(b);
-	if ((res = krk_unbindMethod(type, methodName))) {
-		krk_swap(1);
-		if (res == 2) {
-			krk_pop();
-		}
-		krk_push(a);
-		value = krk_callStack(res == 2 ? 1 : 2);
-		if (!IS_NOTIMPL(value)) goto _success;
-		krk_pop(); /* name */
-	} else {
-		krk_pop(); /* b */
-		krk_pop(); /* name */
-	}
-
-	return krk_runtimeError(vm.exceptions->typeError,
-		"unsupported operand types for %s: '%s' and '%s'",
-		operator, krk_typeName(a), krk_typeName(b));
-
-_success:
-	krk_pop(); /* name */
-	/* Return result */
-	return value;
-}
-
-/**
- * Basic arithmetic and string functions follow.
- */
-
-#define MAKE_BIN_OP(name,operator,inv) \
-	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		if (IS_INTEGER(a) && IS_INTEGER(b)) return INTEGER_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		if (IS_FLOATING(a)) { \
-			if (IS_INTEGER(b)) return FLOATING_VAL(AS_FLOATING(a) operator (double)AS_INTEGER(b)); \
-			else if (IS_FLOATING(b)) return FLOATING_VAL(AS_FLOATING(a) operator AS_FLOATING(b)); \
-		} else if (IS_FLOATING(b)) { \
-			if (IS_INTEGER(a)) return FLOATING_VAL((double)AS_INTEGER(a) operator AS_FLOATING(b)); \
-		} \
-		return tryBind("__" #name "__", a, b, #operator, "__" #inv "__"); \
-	}
-
-MAKE_BIN_OP(add,+,radd)
-MAKE_BIN_OP(sub,-,ssub)
-MAKE_BIN_OP(mul,*,rmul)
-
-/**
- * Division operators.
- */
-KrkValue krk_operator_truediv(KrkValue a, KrkValue b) {
-	if (IS_INTEGER(a)) {
-		if (IS_INTEGER(b)) return FLOATING_VAL((double)AS_INTEGER(a) / (double)AS_INTEGER(b));
-		else if (IS_FLOATING(b)) return FLOATING_VAL((double)AS_INTEGER(a) / AS_FLOATING(b));
-	} else if (IS_FLOATING(a)) {
-		if (IS_FLOATING(b)) return FLOATING_VAL(AS_FLOATING(a) / AS_FLOATING(b));
-		else if (IS_INTEGER(b)) return FLOATING_VAL(AS_FLOATING(a) / (double)AS_INTEGER(b));
-	}
-	return tryBind("__truediv__", a, b, "/", "__rtruediv__");
-}
-
-#ifdef __TINYC__
-#include <math.h>
-#define __builtin_floor floor
+#if !defined(__has_attribute)
+# define __has_attribute(attr) 0
 #endif
 
-KrkValue krk_operator_floordiv(KrkValue numerator, KrkValue divisor) {
-	if (IS_INTEGER(divisor) && IS_INTEGER(numerator)) return INTEGER_VAL(AS_INTEGER(numerator) / AS_INTEGER(divisor));
-	else if (IS_INTEGER(divisor) && IS_FLOATING(numerator)) return FLOATING_VAL(__builtin_floor(AS_FLOATING(numerator) / (double)AS_INTEGER(divisor)));
-	else if (IS_FLOATING(divisor)) {
-		if (IS_FLOATING(numerator)) return FLOATING_VAL(__builtin_floor(AS_FLOATING(numerator) / AS_FLOATING(divisor)));
-		else if (IS_INTEGER(numerator)) return FLOATING_VAL(__builtin_floor((double)AS_INTEGER(numerator) / AS_FLOATING(divisor)));
+#if __has_attribute(protected)
+# define _protected __attribute__((protected))
+#else
+# define _protected
+#endif
+
+#define MAKE_COMPARE_OP(name,operator,inv) \
+	_protected KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
+		KrkClass * atype = krk_getType(a); \
+		if (likely(atype->_ ## name != NULL)) { \
+			krk_push(a); krk_push(b); \
+			KrkValue result = krk_callDirect(atype->_ ## name, 2); \
+			if (likely(!IS_NOTIMPL(result))) { return result; } \
+		} \
+		if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) return NONE_VAL(); \
+		KrkClass * btype = krk_getType(b); \
+		if (btype->_ ## inv) { \
+			krk_push(b); krk_push(a); \
+			KrkValue result = krk_callDirect(btype->_ ## inv, 2); \
+			if (likely(!IS_NOTIMPL(result))) { return result; } \
+		} \
+		if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) return NONE_VAL(); \
+		return krk_runtimeError(vm.exceptions->typeError, \
+			"unsupported operand types for %s: '%T' and '%T'", \
+			operator, a, b); \
 	}
-	return tryBind("__floordiv__", numerator, divisor, "//", "__rfloordiv__");
+#define MAKE_BIN_OP(name,operator,inv) \
+	MAKE_COMPARE_OP(name,operator,inv) \
+	_protected KrkValue krk_operator_i ## name (KrkValue a, KrkValue b) { \
+		KrkClass * atype = krk_getType(a); \
+		if (likely(atype->_i ## name != NULL)) { \
+			krk_push(a); krk_push(b); \
+			KrkValue result = krk_callDirect(atype->_i ## name, 2); \
+			if (!IS_NOTIMPL(result)) { return result; } \
+		} \
+		if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) return NONE_VAL(); \
+		return krk_operator_ ## name(a,b); \
+	}
+
+MAKE_BIN_OP(add,"+",radd)
+MAKE_BIN_OP(sub,"-",rsub)
+MAKE_BIN_OP(mul,"*",rmul)
+MAKE_BIN_OP(pow,"**",rpow)
+MAKE_BIN_OP(or,"|",ror)
+MAKE_BIN_OP(xor,"^",rxor)
+MAKE_BIN_OP(and,"&",rand)
+MAKE_BIN_OP(lshift,"<<",rlshift)
+MAKE_BIN_OP(rshift,">>",rrshift)
+MAKE_BIN_OP(mod,"%",rmod)
+MAKE_BIN_OP(truediv,"/",rtruediv)
+MAKE_BIN_OP(floordiv,"//",rfloordiv)
+MAKE_BIN_OP(matmul,"@",rmatmul)
+
+MAKE_COMPARE_OP(lt, "<", gt)
+MAKE_COMPARE_OP(gt, ">", lt)
+MAKE_COMPARE_OP(le, "<=", ge)
+MAKE_COMPARE_OP(ge, ">=", le)
+
+_protected
+KrkValue krk_operator_eq(KrkValue a, KrkValue b) {
+	return BOOLEAN_VAL(krk_valuesEqual(a,b));
 }
 
-#define MAKE_UNOPTIMIZED_BIN_OP(name,operator,inv) \
-	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		return tryBind("__" #name "__", a, b, #operator, "__" #inv "__"); \
-	}
+_protected
+KrkValue krk_operator_is(KrkValue a, KrkValue b) {
+	return BOOLEAN_VAL(krk_valuesSame(a,b));
+}
 
-MAKE_UNOPTIMIZED_BIN_OP(pow,**,rpow)
-
-/* Bit ops are invalid on doubles in C, so we can't use the same set of macros for them;
- * they should be invalid in Kuroko as well. */
-#define MAKE_BIT_OP_BOOL(name,operator,inv) \
-	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		if (IS_BOOLEAN(a) && IS_BOOLEAN(b)) return BOOLEAN_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		if (IS_INTEGER(a) && IS_INTEGER(b)) return INTEGER_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		return tryBind("__" #name "__", a, b, #operator, "__" #inv "__"); \
-	}
-#define MAKE_BIT_OP(name,operator,inv) \
-	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		if (IS_INTEGER(a) && IS_INTEGER(b)) return INTEGER_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		return tryBind("__" #name "__", a, b, #operator, "__" #inv "__"); \
-	}
-
-MAKE_BIT_OP_BOOL(or,|,ror)
-MAKE_BIT_OP_BOOL(xor,^,rxor)
-MAKE_BIT_OP_BOOL(and,&,rand)
-MAKE_BIT_OP(lshift,<<,rlshift)
-MAKE_BIT_OP(rshift,>>,rrshift)
-MAKE_BIT_OP(mod,%,rmod) /* not a bit op, but doesn't work on floating point */
-
-#define MAKE_COMPARATOR(name, operator,inv) \
-	KrkValue krk_operator_ ## name (KrkValue a, KrkValue b) { \
-		if (IS_INTEGER(a) && IS_INTEGER(b)) return BOOLEAN_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
-		if (IS_FLOATING(a)) { \
-			if (IS_INTEGER(b)) return BOOLEAN_VAL(AS_FLOATING(a) operator (double)AS_INTEGER(b)); \
-			else if (IS_FLOATING(b)) return BOOLEAN_VAL(AS_FLOATING(a) operator AS_FLOATING(b)); \
-		} else if (IS_FLOATING(b)) { \
-			if (IS_INTEGER(a)) return BOOLEAN_VAL((double)AS_INTEGER(a) operator AS_FLOATING(b)); \
+#define MAKE_UNARY_OP(sname,operator,op) \
+	_protected KrkValue krk_operator_ ## operator (KrkValue value) { \
+		KrkClass * type = krk_getType(value); \
+		if (likely(type-> sname != NULL)) { \
+			krk_push(value); \
+			return krk_callDirect(type-> sname, 1); \
 		} \
-		return tryBind("__" #name "__", a, b, #operator, "__" #inv "__"); \
+		if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) return NONE_VAL(); \
+		return krk_runtimeError(vm.exceptions->typeError, "bad operand type for unary %s: '%T'", #op, value); \
 	}
 
-MAKE_COMPARATOR(lt, <, gt)
-MAKE_COMPARATOR(gt, >, lt)
-MAKE_COMPARATOR(le, <=, ge)
-MAKE_COMPARATOR(ge, >=, le)
+MAKE_UNARY_OP(_invert,invert,~)
+MAKE_UNARY_OP(_negate,neg,-)
+MAKE_UNARY_OP(_pos,pos,+)
 
 /**
  * At the end of each instruction cycle, we check the exception flag to see
@@ -1660,9 +1165,9 @@ static int handleException() {
 	int exitSlot = (krk_currentThread.exitOnFrame >= 0) ? krk_currentThread.frames[krk_currentThread.exitOnFrame].outSlots : 0;
 	for (stackOffset = (int)(krk_currentThread.stackTop - krk_currentThread.stack - 1);
 		stackOffset >= exitSlot &&
-		!IS_TRY_HANDLER(krk_currentThread.stack[stackOffset]) &&
-		!IS_WITH_HANDLER(krk_currentThread.stack[stackOffset]) &&
-		!IS_EXCEPT_HANDLER(krk_currentThread.stack[stackOffset])
+		!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset], OP_PUSH_TRY) &&
+		!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset], OP_PUSH_WITH) &&
+		!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset], OP_FILTER_EXCEPT)
 		; stackOffset--);
 	if (stackOffset < exitSlot) {
 		if (exitSlot == 0) {
@@ -1673,8 +1178,13 @@ static int handleException() {
 			 * this reset, so the repl can throw errors and keep accepting new lines.
 			 */
 			if (!(vm.globalFlags & KRK_GLOBAL_CLEAN_OUTPUT)) krk_dumpTraceback();
-			krk_currentThread.frameCount = 0;
 		}
+		krk_currentThread.frameCount = krk_currentThread.exitOnFrame;
+
+		/* Ensure stack is in the expected place, as if we returned None. */
+		closeUpvalues(exitSlot);
+		krk_currentThread.stackTop = &krk_currentThread.stack[exitSlot];
+
 		/* If exitSlot was not 0, there was an exception during a call to runNext();
 		 * this is likely to be raised higher up the stack as an exception in the outer
 		 * call, but we don't want to print the traceback here. */
@@ -1707,21 +1217,25 @@ static int handleException() {
  * object module, the later search path will still win.
  */
 int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, KrkValue parent) {
-	KrkValue modulePaths;
-
 	/* See if the module is already loaded */
 	if (krk_tableGet_fast(&vm.modules, runAs, moduleOut)) {
 		krk_push(*moduleOut);
 		return 1;
 	}
 
-#ifndef NO_FILESYSTEM
+#ifndef KRK_NO_FILESYSTEM
+	KrkValue modulePaths;
 
 	/* Obtain __builtins__.module_paths */
-	if (!krk_tableGet_fast(&vm.system->fields, S("module_paths"), &modulePaths) || !IS_INSTANCE(modulePaths)) {
+	if (!vm.system || !krk_tableGet_fast(&vm.system->fields, S("module_paths"), &modulePaths)) {
 		*moduleOut = NONE_VAL();
-		krk_runtimeError(vm.exceptions->importError,
-			"kuroko.module_paths not defined.");
+		krk_runtimeError(vm.exceptions->importError, "kuroko.module_paths not defined.");
+		return 0;
+	}
+
+	if (!IS_list(modulePaths)) {
+		*moduleOut = NONE_VAL();
+		krk_runtimeError(vm.exceptions->importError, "kuroko.module_paths must be a list, not '%T'", modulePaths);
 		return 0;
 	}
 
@@ -1745,7 +1259,7 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 		if (!IS_STRING(krk_peek(0))) {
 			*moduleOut = NONE_VAL();
 			krk_runtimeError(vm.exceptions->typeError,
-				"Module search paths must be strings; check the search path at index %d", i);
+				"Module search path must be str, not '%T'", krk_peek(0));
 			return 0;
 		}
 
@@ -1775,8 +1289,8 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 				/* Try to import that. */
 				KrkValue dotted_main = krk_peek(0);
 				if (!krk_importModule(AS_STRING(dotted_main),runAs)) {
-					krk_runtimeError(vm.exceptions->importError, "No module named %s; '%s' is a package and cannot be executed directly",
-						AS_CSTRING(dotted_main), AS_CSTRING(packageName));
+					krk_runtimeError(vm.exceptions->importError, "No module named '%S'; '%S' is a package and cannot be executed directly",
+						AS_STRING(dotted_main), AS_STRING(packageName));
 					return 0;
 				}
 
@@ -1837,13 +1351,13 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 				krk_attachNamedValue(&krk_currentThread.module->fields, "__package__", NONE_VAL());
 			}
 		}
-		krk_callfile(fileName,fileName);
+		krk_runfile(fileName,fileName);
 		*moduleOut = OBJECT_VAL(krk_currentThread.module);
 		krk_currentThread.module = enclosing;
 		if (!IS_OBJECT(*moduleOut)) {
 			if (!(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) {
 				krk_runtimeError(vm.exceptions->importError,
-					"Failed to load module '%s' from '%s'", runAs->chars, fileName);
+					"Failed to load module '%S' from '%s'", runAs, fileName);
 			}
 			return 0;
 		}
@@ -1859,7 +1373,7 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 		if (!dlRef) {
 			*moduleOut = NONE_VAL();
 			krk_runtimeError(vm.exceptions->importError,
-				"Failed to load native module '%s' from shared object '%s'", runAs->chars, fileName);
+				"Failed to load native module '%S' from shared object '%s'", runAs, fileName);
 			return 0;
 		}
 
@@ -1893,7 +1407,7 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 		if (!krk_isInstanceOf(*moduleOut, vm.baseClasses->moduleClass)) {
 			dlClose(dlRef);
 			krk_runtimeError(vm.exceptions->importError,
-				"Failed to load module '%s' from '%s'", runAs->chars, fileName);
+				"Failed to load module '%S' from '%s'", runAs, fileName);
 			return 0;
 		}
 
@@ -1928,7 +1442,7 @@ int krk_loadModule(KrkString * path, KrkValue * moduleOut, KrkString * runAs, Kr
 		krk_push(OBJECT_VAL(runAs));
 	}
 
-	krk_runtimeError(vm.exceptions->importError, "No module named '%s'", AS_CSTRING(krk_peek(0)));
+	krk_runtimeError(vm.exceptions->importError, "No module named '%S'", AS_STRING(krk_peek(0)));
 
 	return 0;
 }
@@ -2109,7 +1623,7 @@ int krk_importModule(KrkString * name, KrkString * runAs) {
 			/* Is this a package? */
 			KrkValue tmp;
 			if (!krk_tableGet_fast(&AS_INSTANCE(current)->fields, S("__ispackage__"), &tmp) || !IS_BOOLEAN(tmp) || AS_BOOLEAN(tmp) != 1) {
-				krk_runtimeError(vm.exceptions->importError, "'%s' is not a package", AS_CSTRING(krk_currentThread.stack[argBase+2]));
+				krk_runtimeError(vm.exceptions->importError, "'%S' is not a package", AS_STRING(krk_currentThread.stack[argBase+2]));
 				return 0;
 			}
 			krk_currentThread.stack[argBase-1] = krk_pop();
@@ -2131,126 +1645,182 @@ int krk_doRecursiveModuleLoad(KrkString * name) {
 	return krk_importModule(name,name);
 }
 
-/**
- * Try to resolve and push [stack top].name.
- * If [stack top] is an instance, scan fields first.
- * Otherwise, scan for methods from [stack top].__class__.
- * Returns 0 if nothing was found, 1 if something was - and that
- * "something" will replace [stack top].
- */
-static int valueGetProperty(KrkString * name) {
-	KrkValue this = krk_peek(0);
-	KrkClass * objectClass;
-	KrkValue value;
-	if (IS_INSTANCE(this)) {
-		KrkInstance * instance = AS_INSTANCE(this);
-		if (krk_tableGet_fast(&instance->fields, name, &value)) {
-			krk_currentThread.stackTop[-1] = value;
-			return 1;
+#define CACHE_SIZE 4096
+typedef struct {
+	KrkString * name;
+	struct KrkClass  * owner;
+	KrkValue    value;
+	size_t index;
+} KrkClassCacheEntry;
+static KrkClassCacheEntry cache[CACHE_SIZE] = {0};
+static size_t nextCount = 1;
+
+static KrkClass * checkCache(KrkClass * type, KrkString * name, KrkValue * method) {
+	size_t index = (name->obj.hash ^ (type->obj.hash << 4)) & (CACHE_SIZE-1);
+	KrkClassCacheEntry * entry = &cache[index];
+	if (entry->name == name && entry->index == type->cacheIndex) {
+		*method = entry->value;
+		return entry->owner;
+	}
+
+	KrkClass * _class = NULL;
+	if (krk_tableGet_fast(&type->methods, name, method)) {
+		_class = type;
+	} else if (type->base) {
+		_class = checkCache(type->base, name, method);
+	}
+
+	if (!type->cacheIndex) {
+		type->cacheIndex = nextCount++;
+	}
+	entry->name = name;
+	entry->owner = _class;
+	entry->value = *method;
+	entry->index = type->cacheIndex;
+	return _class;
+}
+
+static void clearCache(KrkClass * type) {
+	if (type->cacheIndex) {
+		type->cacheIndex = 0;
+		for (size_t i = 0; i < type->subclasses.capacity; ++i) {
+			KrkTableEntry * entry = &type->subclasses.entries[i];
+			if (entry->key == KWARGS_VAL(0)) continue;
+			clearCache(AS_CLASS(entry->key));
 		}
-		objectClass = instance->_class;
-	} else if (IS_CLASS(this)) {
-		KrkClass * _class = AS_CLASS(this);
-		do {
-			if (krk_tableGet_fast(&_class->methods, name, &value)) {
-				if ((IS_CLOSURE(value) && (AS_CLOSURE(value)->flags & KRK_FUNCTION_FLAGS_IS_CLASS_METHOD)) ||
-				    (IS_NATIVE(value) && (AS_NATIVE(value)->flags & KRK_NATIVE_FLAGS_IS_CLASS_METHOD))) {
-					value = OBJECT_VAL(krk_newBoundMethod(this, AS_OBJECT(value)));
-				}
-				krk_currentThread.stackTop[-1] = value;
-				return 1;
-			}
-			_class = _class->base;
-		} while (_class);
-		objectClass = vm.baseClasses->typeClass;
-	} else if (IS_CLOSURE(krk_peek(0))) {
-		KrkClosure * closure = AS_CLOSURE(this);
-		if (krk_tableGet_fast(&closure->fields, name, &value)) {
-			krk_currentThread.stackTop[-1] = value;
-			return 1;
-		}
-		objectClass = vm.baseClasses->functionClass;
-	} else {
-		objectClass = krk_getType(this);
 	}
-
-	/* See if the base class for this non-instance type has a method available */
-	if (krk_bindMethod(objectClass, name)) {
-		return 1;
-	}
-
-	if (objectClass->_getattr) {
-		krk_push(OBJECT_VAL(name));
-		krk_push(krk_callDirect(objectClass->_getattr, 2));
-		return 1;
-	}
-
-	return 0;
 }
 
 /**
- * Similar to the above, but specifically for getting properties that will be
- * immediately called, eg. for GET_METHOD that is followed by argument pushing
- * and then CALL_METHOD.
+ * Attach a method call to its callee and return a BoundMethod.
+ * Works for managed and native method calls.
  */
+int krk_bindMethod(KrkClass * originalClass, KrkString * name) {
+	KrkValue method, out;
+	KrkClass * _class = checkCache(originalClass, name, &method);
+	if (!_class) return 0;
+	if (IS_NATIVE(method)||IS_CLOSURE(method)) {
+		if (AS_OBJECT(method)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD) {
+			out = OBJECT_VAL(krk_newBoundMethod(OBJECT_VAL(originalClass), AS_OBJECT(method)));
+		} else if (AS_OBJECT(method)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD) {
+			out = method;
+		} else {
+			out = OBJECT_VAL(krk_newBoundMethod(krk_peek(0), AS_OBJECT(method)));
+		}
+	} else {
+		/* Does it have a descriptor __get__? */
+		KrkClass * type = krk_getType(method);
+		if (type->_descget) {
+			krk_push(method);
+			krk_swap(1);
+			krk_push(krk_callDirect(type->_descget, 2));
+			return 1;
+		}
+		out = method;
+	}
+	krk_pop();
+	krk_push(out);
+	return 1;
+}
+
+
 static int valueGetMethod(KrkString * name) {
 	KrkValue this = krk_peek(0);
-	KrkClass * objectClass;
-	KrkValue value;
-	if (IS_INSTANCE(this)) {
-		KrkInstance * instance = AS_INSTANCE(this);
-		if (krk_tableGet_fast(&instance->fields, name, &value)) {
-			krk_push(value);
-			return 2;
+	KrkClass * myClass = krk_getType(this);
+	KrkValue value, method;
+	KrkClass * _class = checkCache(myClass, name, &method);
+
+	/* Class descriptors */
+	if (_class) {
+		KrkClass * valtype = krk_getType(method);
+		if (valtype->_descget) {
+			krk_push(method);
+			krk_push(this);
+			value = krk_callDirect(valtype->_descget, 2);
+			goto found;
 		}
-		objectClass = instance->_class;
-	} else if (IS_CLASS(this)) {
-		KrkClass * _class = AS_CLASS(this);
-		do {
-			if (krk_tableGet_fast(&_class->methods, name, &value)) {
-				if ((IS_CLOSURE(value) && (AS_CLOSURE(value)->flags & KRK_FUNCTION_FLAGS_IS_CLASS_METHOD)) ||
-				    (IS_NATIVE(value) && (AS_NATIVE(value)->flags & KRK_NATIVE_FLAGS_IS_CLASS_METHOD))) {
-					krk_push(value);
-					return 1;
-				}
-				krk_push(value);
-				return 2;
-			}
-			_class = _class->base;
-		} while (_class);
-		objectClass = vm.baseClasses->typeClass;
-	} else if (IS_CLOSURE(krk_peek(0))) {
-		KrkClosure * closure = AS_CLOSURE(this);
-		if (krk_tableGet_fast(&closure->fields, name, &value)) {
-			krk_push(value);
-			return 2;
-		}
-		objectClass = vm.baseClasses->functionClass;
-	} else {
-		objectClass = krk_getType(this);
 	}
 
-	/* See if the base class for this non-instance type has a method available */
-	int maybe = krk_unbindMethod(objectClass, name);
-	if (maybe) return maybe;
+	/* Fields */
+	if (IS_INSTANCE(this)) {
+		if (krk_tableGet_fast(&AS_INSTANCE(this)->fields, name, &value)) goto found;
+	} else if (IS_CLASS(this)) {
+		KrkClass * type = AS_CLASS(this);
+		do {
+			if (krk_tableGet_fast(&type->methods, name, &value)) {
+				if ((IS_NATIVE(value) || IS_CLOSURE(value)) && (AS_OBJECT(value)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD)) {
+					goto found_method;
+				}
+				goto found;
+			}
+			type = type->base;
+		} while (type);
+	} else if (IS_CLOSURE(this)) {
+		if (krk_tableGet_fast(&AS_CLOSURE(this)->fields, name, &value)) goto found;
+	}
 
-	if (objectClass->_getattr) {
-		krk_push(krk_peek(0));
+	/* Method from type */
+	if (_class) {
+		if (IS_NATIVE(method)||IS_CLOSURE(method)) {
+			if (AS_OBJECT(method)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD) {
+				krk_currentThread.stackTop[-1] = OBJECT_VAL(myClass);
+				value = method;
+				goto found_method;
+			} else if (AS_OBJECT(method)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD) {
+				value = method;
+			} else {
+				value = method;
+				goto found_method;
+			}
+		} else {
+			value = method;
+		}
+		goto found;
+	}
+
+	/* __getattr__ */
+	if (myClass->_getattr) {
+		krk_push(this);
 		krk_push(OBJECT_VAL(name));
-		krk_push(krk_callDirect(objectClass->_getattr, 2));
-		return 2;
+		value = krk_callDirect(myClass->_getattr, 2);
+		goto found;
 	}
 
 	return 0;
 
+found:
+	krk_push(value);
+	return 2;
+
+found_method:
+	krk_push(value);
+	return 1;
 }
 
+static int valueGetProperty(KrkString * name) {
+	switch (valueGetMethod(name)) {
+		case 2:
+			krk_currentThread.stackTop[-2] = krk_currentThread.stackTop[-1];
+			krk_currentThread.stackTop--;
+			return 1;
+		case 1:
+			krk_currentThread.stackTop[-2] = OBJECT_VAL(krk_newBoundMethod(krk_currentThread.stackTop[-2], AS_OBJECT(krk_currentThread.stackTop[-1])));
+			krk_currentThread.stackTop--;
+			return 1;
+		default:
+			return 0;
+	}
+}
+
+int krk_getAttribute(KrkString * name) {
+	return valueGetProperty(name);
+}
 
 KrkValue krk_valueGetAttribute(KrkValue value, char * name) {
 	krk_push(OBJECT_VAL(krk_copyString(name,strlen(name))));
 	krk_push(value);
 	if (!valueGetProperty(AS_STRING(krk_peek(1)))) {
-		return krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(0)), name);
+		return krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%s'", krk_peek(0), name);
 	}
 	krk_swap(1);
 	krk_pop(); /* String */
@@ -2283,40 +1853,48 @@ static int valueDelProperty(KrkString * name) {
 		if (!krk_tableDelete(&_class->methods, OBJECT_VAL(name))) {
 			return 0;
 		}
-		if (name->length && name->chars[0] == '_') {
+		if (name->length > 1 && name->chars[0] == '_' && name->chars[1] == '_') {
 			krk_finalizeClass(_class);
+		} else {
+			clearCache(_class);
 		}
 		krk_pop(); /* the original value */
 		return 1;
+	} else if (IS_CLOSURE(krk_peek(0))) {
+		KrkClosure * closure = AS_CLOSURE(krk_peek(0));
+		if (!krk_tableDelete(&closure->fields, OBJECT_VAL(name))) {
+			return 0;
+		}
+		krk_pop();
+		return 1;
 	}
-	/* TODO del on values? */
+	/* TODO __delattr__? Descriptor __delete__ methods? */
 	return 0;
+}
+
+int krk_delAttribute(KrkString * name) {
+	return valueDelProperty(name);
 }
 
 KrkValue krk_valueDelAttribute(KrkValue owner, char * name) {
 	krk_push(OBJECT_VAL(krk_copyString(name,strlen(name))));
 	krk_push(owner);
 	if (!valueDelProperty(AS_STRING(krk_peek(1)))) {
-		return krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(0)), name);
+		return krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%s'", krk_peek(0), name);
 	}
 	krk_pop(); /* String */
 	return NONE_VAL();
 }
 
-static int trySetDescriptor(KrkValue owner, KrkString * name, KrkValue value) {
-	KrkClass * _class = krk_getType(owner);
+static int _setDescriptor(KrkValue owner, KrkClass * _class, KrkString * name, KrkValue to) {
 	KrkValue property;
-	while (_class) {
-		if (krk_tableGet_fast(&_class->methods, name, &property)) break;
-		_class = _class->base;
-	}
+	_class = checkCache(_class, name, &property);
 	if (_class) {
 		KrkClass * type = krk_getType(property);
 		if (type->_descset) {
-			/* Need to rearrange arguments */
-			krk_push(property); /* owner value property */
-			krk_swap(2);        /* property value owner */
-			krk_swap(1);        /* property owner value */
+			krk_push(property);
+			krk_push(owner);
+			krk_push(to);
 			krk_push(krk_callDirect(type->_descset, 3));
 			return 1;
 		}
@@ -2324,36 +1902,53 @@ static int trySetDescriptor(KrkValue owner, KrkString * name, KrkValue value) {
 	return 0;
 }
 
+static KrkValue setAttr_wrapper(KrkValue owner, KrkClass * _class, KrkTable * fields, KrkString * name, KrkValue to) {
+	if (_setDescriptor(owner,_class,name,to)) return krk_pop();
+	krk_tableSet(fields, OBJECT_VAL(name), to);
+	return to;
+}
+
+_noexport
+KrkValue krk_instanceSetAttribute_wrapper(KrkValue owner, KrkString * name, KrkValue to) {
+	return setAttr_wrapper(owner, AS_INSTANCE(owner)->_class, &AS_INSTANCE(owner)->fields, name, to);
+}
+
 static int valueSetProperty(KrkString * name) {
 	KrkValue owner = krk_peek(1);
 	KrkValue value = krk_peek(0);
+	KrkClass * type = krk_getType(owner);
+	if (unlikely(type->_setattr != NULL)) {
+		krk_push(OBJECT_VAL(name));
+		krk_swap(1);
+		krk_push(krk_callDirect(type->_setattr, 3));
+		return 1;
+	}
 	if (IS_INSTANCE(owner)) {
-		if (krk_tableSet(&AS_INSTANCE(owner)->fields, OBJECT_VAL(name), value)) {
-			if (trySetDescriptor(owner, name, value)) {
-				krk_tableDelete(&AS_INSTANCE(owner)->fields, OBJECT_VAL(name));
-				return 1;
-			}
-		}
+		krk_currentThread.stackTop[-1] = setAttr_wrapper(owner,type,&AS_INSTANCE(owner)->fields, name, value);
 	} else if (IS_CLASS(owner)) {
-		krk_tableSet(&AS_CLASS(owner)->methods, OBJECT_VAL(name), value);
-		if (name->length && name->chars[0] == '_') {
-			/* Quietly call finalizeClass to update special method table if this looks like it might be one */
+		krk_currentThread.stackTop[-1] = setAttr_wrapper(owner,type,&AS_CLASS(owner)->methods, name, value);
+		if (name->length > 1 && name->chars[0] == '_' && name->chars[1] == '_') {
 			krk_finalizeClass(AS_CLASS(owner));
+		} else {
+			clearCache(AS_CLASS(owner));
 		}
 	} else if (IS_CLOSURE(owner)) {
-		/* Closures shouldn't have descriptors, but let's let this happen anyway... */
-		if (krk_tableSet(&AS_CLOSURE(owner)->fields, OBJECT_VAL(name), value)) {
-			if (trySetDescriptor(owner, name, value)) {
-				krk_tableDelete(&AS_CLOSURE(owner)->fields, OBJECT_VAL(name));
-				return 1;
-			}
-		}
+		krk_currentThread.stackTop[-1] = setAttr_wrapper(owner,type,&AS_CLOSURE(owner)->fields, name, value);
 	} else {
-		return (trySetDescriptor(owner,name,value));
+		if (_setDescriptor(owner,type,name,value)) {
+			krk_swap(1);
+			krk_pop();
+		} else {
+			return 0;
+		}
 	}
 	krk_swap(1);
 	krk_pop();
 	return 1;
+}
+
+int krk_setAttribute(KrkString * name) {
+	return valueSetProperty(name);
 }
 
 KrkValue krk_valueSetAttribute(KrkValue owner, char * name, KrkValue to) {
@@ -2361,28 +1956,131 @@ KrkValue krk_valueSetAttribute(KrkValue owner, char * name, KrkValue to) {
 	krk_push(owner);
 	krk_push(to);
 	if (!valueSetProperty(AS_STRING(krk_peek(2)))) {
-		return krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(1)), name);
+		return krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%s'", krk_peek(1), name);
 	}
 	krk_swap(1);
 	krk_pop(); /* String */
 	return krk_pop();
 }
 
-#define READ_BYTE() (*frame->ip++)
 #define BINARY_OP(op) { KrkValue b = krk_peek(0); KrkValue a = krk_peek(1); \
 	a = krk_operator_ ## op (a,b); \
 	krk_currentThread.stackTop[-2] = a; krk_pop(); break; }
-#define BINARY_OP_CHECK_ZERO(op) { KrkValue b = krk_peek(0); KrkValue a = krk_peek(1); \
-	if ((IS_INTEGER(b) && AS_INTEGER(b) == 0)) { krk_runtimeError(vm.exceptions->zeroDivisionError, "integer division or modulo by zero"); goto _finishException; } \
-	else if ((IS_FLOATING(b) && AS_FLOATING(b) == 0.0)) { krk_runtimeError(vm.exceptions->zeroDivisionError, "float division by zero"); goto _finishException; } \
-	a = krk_operator_ ## op (a,b); \
+#define INPLACE_BINARY_OP(op) { KrkValue b = krk_peek(0); KrkValue a = krk_peek(1); \
+	a = krk_operator_i ## op (a,b); \
 	krk_currentThread.stackTop[-2] = a; krk_pop(); break; }
+
+extern KrkValue krk_int_op_add(krk_integer_type a, krk_integer_type b);
+extern KrkValue krk_int_op_sub(krk_integer_type a, krk_integer_type b);
+
+/* These operations are most likely to occur on integers, so we special case them */
+#define LIKELY_INT_BINARY_OP(op) { KrkValue b = krk_peek(0); KrkValue a = krk_peek(1); \
+	if (likely(IS_INTEGER(a) && IS_INTEGER(b))) a = krk_int_op_ ## op (AS_INTEGER(a), AS_INTEGER(b)); \
+	else a = krk_operator_ ## op (a,b); \
+	krk_currentThread.stackTop[-2] = a; krk_pop(); break; }
+
+/* Comparators like these are almost definitely going to happen on integers. */
+#define LIKELY_INT_COMPARE_OP(op,operator) { KrkValue b = krk_peek(0); KrkValue a = krk_peek(1); \
+	if (likely(IS_INTEGER(a) && IS_INTEGER(b))) a = BOOLEAN_VAL(AS_INTEGER(a) operator AS_INTEGER(b)); \
+	else a = krk_operator_ ## op (a,b); \
+	krk_currentThread.stackTop[-2] = a; krk_pop(); break; }
+
+#define LIKELY_INT_UNARY_OP(op,operator) { KrkValue a = krk_peek(0); \
+	if (likely(IS_INTEGER(a))) a = INTEGER_VAL(operator AS_INTEGER(a)); \
+	else a = krk_operator_ ## op (a); \
+	krk_currentThread.stackTop[-1] = a; break; }
+
+#define READ_BYTE() (*frame->ip++)
 #define READ_CONSTANT(s) (frame->closure->function->chunk.constants.values[OPERAND])
 #define READ_STRING(s) AS_STRING(READ_CONSTANT(s))
 
 extern FUNC_SIG(list,append);
 extern FUNC_SIG(dict,__setitem__);
 extern FUNC_SIG(set,add);
+
+static inline void makeCollection(NativeFn func, size_t count) {
+	KrkValue collection = krk_callNativeOnStack(count, &krk_currentThread.stackTop[-count], 0, func);
+	if (count) {
+		krk_currentThread.stackTop[-count] = collection;
+		while (count > 1) {
+			krk_pop();
+			count--;
+		}
+	} else {
+		krk_push(collection);
+	}
+}
+
+static inline int doFormatString(int options) {
+	if (options & FORMAT_OP_FORMAT) {
+		krk_swap(1);
+		if (options & FORMAT_OP_EQ) {
+			krk_swap(2);
+		}
+	} else if (options & FORMAT_OP_EQ) {
+		krk_swap(1);
+	}
+
+	/* Was this a repr or str call? (it can't be both) */
+	if (options & FORMAT_OP_STR) {
+		KrkClass * type = krk_getType(krk_peek(0));
+		if (likely(type->_tostr != NULL)) {
+			krk_push(krk_callDirect(type->_tostr, 1));
+			if (unlikely(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) return 1;
+		} else {
+			krk_runtimeError(vm.exceptions->typeError,
+				"Can not convert '%T' to str", krk_peek(0));
+			return 1;
+		}
+	} else if (options & FORMAT_OP_REPR) {
+		KrkClass * type = krk_getType(krk_peek(0));
+		if (likely(type->_reprer != NULL)) {
+			krk_push(krk_callDirect(type->_reprer, 1));
+			if (unlikely(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) return 1;
+		} else {
+			krk_runtimeError(vm.exceptions->typeError,
+				"Can not repr '%T'", krk_peek(0));
+			return 1;
+		}
+	}
+
+	if (!(options & FORMAT_OP_FORMAT)) {
+		/* Push empty string */
+		krk_push(OBJECT_VAL(S("")));
+	} else {
+		/* Swap args so value is first */
+		krk_swap(1);
+	}
+
+	/* Get the type of the value */
+	KrkClass * type = krk_getType(krk_peek(1));
+
+	if (likely(type->_format != NULL)) {
+		krk_push(krk_callDirect(type->_format, 2));
+		if (unlikely(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) return 1;
+	} else {
+		krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%s'", krk_peek(1), "__format__");
+		return 1;
+	}
+
+	if (!IS_STRING(krk_peek(0))) {
+		krk_runtimeError(vm.exceptions->typeError, "format result is not str");
+		return 1;
+	}
+
+	return 0;
+}
+
+static inline void commonMethodInvoke(size_t methodOffset, int args, const char * msgFormat) {
+	KrkClass * type = krk_getType(krk_peek(args-1));
+	KrkObj * method = *(KrkObj**)((char*)type + methodOffset);
+	if (likely(method != NULL)) {
+		krk_push(krk_callDirect(method, args));
+	} else {
+		krk_runtimeError(vm.exceptions->attributeError, msgFormat, krk_peek(args-1));
+	}
+}
+
 
 /**
  * VM main loop.
@@ -2391,17 +2089,20 @@ static KrkValue run() {
 	KrkCallFrame* frame = &krk_currentThread.frames[krk_currentThread.frameCount - 1];
 
 	while (1) {
-#ifndef KRK_NO_TRACING
 		if (unlikely(krk_currentThread.flags & (KRK_THREAD_ENABLE_TRACING | KRK_THREAD_SINGLE_STEP | KRK_THREAD_SIGNALLED))) {
+#ifndef KRK_NO_TRACING
 			if (krk_currentThread.flags & KRK_THREAD_ENABLE_TRACING) {
 				krk_debug_dumpStack(stderr, frame);
 				krk_disassembleInstruction(stderr, frame->closure->function,
 					(size_t)(frame->ip - frame->closure->function->chunk.code));
 			}
+#endif
 
+#ifndef KRK_DISABLE_DEBUG
 			if (krk_currentThread.flags & KRK_THREAD_SINGLE_STEP) {
 				krk_debuggerHook(frame);
 			}
+#endif
 
 			if (krk_currentThread.flags & KRK_THREAD_SIGNALLED) {
 				krk_currentThread.flags &= ~(KRK_THREAD_SIGNALLED); /* Clear signal flag */
@@ -2409,12 +2110,13 @@ static KrkValue run() {
 				goto _finishException;
 			}
 		}
+#ifndef KRK_DISABLE_DEBUG
 _resumeHook: (void)0;
 #endif
 
 		/* Each instruction begins with one opcode byte */
 		KrkOpCode opcode = READ_BYTE();
-		int OPERAND = 0;
+		unsigned int OPERAND = 0;
 
 /* Only GCC lets us put these on empty statements; just hope clang doesn't start complaining */
 #ifndef __clang__
@@ -2425,7 +2127,7 @@ _resumeHook: (void)0;
 
 #define TWO_BYTE_OPERAND { OPERAND = (frame->ip[0] << 8) | frame->ip[1]; frame->ip += 2; }
 #define THREE_BYTE_OPERAND { OPERAND = (frame->ip[0] << 16) | (frame->ip[1] << 8); frame->ip += 2; } FALLTHROUGH
-#define ONE_BYTE_OPERAND { OPERAND |= READ_BYTE(); }
+#define ONE_BYTE_OPERAND { OPERAND = (OPERAND & ~0xFF) | READ_BYTE(); }
 
 		switch (opcode) {
 			case OP_CLEANUP_WITH: {
@@ -2457,6 +2159,11 @@ _resumeHook: (void)0;
 					krk_callDirect(type->_exit, 4);
 					if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) goto _finishException;
 				}
+				if (AS_HANDLER_TYPE(handler) == OP_EXIT_LOOP) {
+					frame->ip = frame->closure->function->chunk.code + AS_HANDLER_TARGET(handler);
+					OPERAND = AS_INTEGER(krk_peek(1));
+					goto _finishPopBlock;
+				}
 				if (AS_HANDLER_TYPE(handler) != OP_RETURN) break;
 				krk_pop(); /* handler */
 			} /* fallthrough */
@@ -2468,9 +2175,9 @@ _finishReturn: (void)0;
 				int stackOffset;
 				for (stackOffset = (int)(krk_currentThread.stackTop - krk_currentThread.stack - 1);
 					stackOffset >= (int)frame->slots && 
-					!IS_WITH_HANDLER(krk_currentThread.stack[stackOffset]) &&
-					!IS_TRY_HANDLER(krk_currentThread.stack[stackOffset]) &&
-					!IS_EXCEPT_HANDLER(krk_currentThread.stack[stackOffset])
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_PUSH_TRY) &&
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_PUSH_WITH) &&
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_FILTER_EXCEPT)
 					; stackOffset--);
 				if (stackOffset >= (int)frame->slots) {
 					krk_currentThread.stackTop = &krk_currentThread.stack[stackOffset + 1];
@@ -2487,7 +2194,7 @@ _finishReturn: (void)0;
 				}
 				krk_currentThread.stackTop = &krk_currentThread.stack[frame->outSlots];
 				if (krk_currentThread.frameCount == (size_t)krk_currentThread.exitOnFrame) {
-					if (frame->closure->function->flags & (KRK_CODEOBJECT_FLAGS_IS_GENERATOR | KRK_CODEOBJECT_FLAGS_IS_COROUTINE)) {
+					if (frame->closure->function->obj.flags & (KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR | KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE)) {
 						krk_push(result);
 						return KWARGS_VAL(0);
 					}
@@ -2497,61 +2204,55 @@ _finishReturn: (void)0;
 				frame = &krk_currentThread.frames[krk_currentThread.frameCount - 1];
 				break;
 			}
-			case OP_EQUAL: {
-				KrkValue b = krk_pop();
-				KrkValue a = krk_pop();
-				krk_push(BOOLEAN_VAL(krk_valuesEqual(a,b)));
-				break;
-			}
-			case OP_IS: {
-				KrkValue b = krk_pop();
-				KrkValue a = krk_pop();
-				krk_push(BOOLEAN_VAL(krk_valuesSame(a,b)));
-				break;
-			}
-			case OP_LESS: BINARY_OP(lt);
-			case OP_GREATER: BINARY_OP(gt);
-			case OP_LESS_EQUAL: BINARY_OP(le);
-			case OP_GREATER_EQUAL: BINARY_OP(ge);
-			case OP_ADD: BINARY_OP(add);
-			case OP_SUBTRACT: BINARY_OP(sub)
-			case OP_MULTIPLY: BINARY_OP(mul)
-			case OP_DIVIDE: BINARY_OP_CHECK_ZERO(truediv)
-			case OP_FLOORDIV: BINARY_OP_CHECK_ZERO(floordiv)
-			case OP_MODULO: BINARY_OP_CHECK_ZERO(mod)
-			case OP_BITOR: BINARY_OP(or)
-			case OP_BITXOR: BINARY_OP(xor)
-			case OP_BITAND: BINARY_OP(and)
-			case OP_SHIFTLEFT: BINARY_OP(lshift)
-			case OP_SHIFTRIGHT: BINARY_OP(rshift)
-			case OP_POW: BINARY_OP(pow)
-			case OP_BITNEGATE: {
-				KrkValue value = krk_pop();
-				if (IS_INTEGER(value)) krk_push(INTEGER_VAL(~AS_INTEGER(value)));
-				else { krk_runtimeError(vm.exceptions->typeError, "Incompatible operand type for %s negation.", "bit"); goto _finishException; }
-				break;
-			}
-			case OP_NEGATE: {
-				KrkValue value = krk_pop();
-				if (IS_INTEGER(value)) krk_push(INTEGER_VAL(-AS_INTEGER(value)));
-				else if (IS_FLOATING(value)) krk_push(FLOATING_VAL(-AS_FLOATING(value)));
-				else { krk_runtimeError(vm.exceptions->typeError, "Incompatible operand type for %s negation.", "prefix"); goto _finishException; }
-				break;
-			}
+			case OP_LESS:          LIKELY_INT_COMPARE_OP(lt,<)
+			case OP_GREATER:       LIKELY_INT_COMPARE_OP(gt,>)
+			case OP_LESS_EQUAL:    LIKELY_INT_COMPARE_OP(le,<=)
+			case OP_GREATER_EQUAL: LIKELY_INT_COMPARE_OP(ge,>=)
+			case OP_ADD:           LIKELY_INT_BINARY_OP(add)
+			case OP_SUBTRACT:      LIKELY_INT_BINARY_OP(sub)
+			case OP_MULTIPLY:      BINARY_OP(mul)
+			case OP_DIVIDE:        BINARY_OP(truediv)
+			case OP_FLOORDIV:      BINARY_OP(floordiv)
+			case OP_MODULO:        BINARY_OP(mod)
+			case OP_BITOR:         BINARY_OP(or)
+			case OP_BITXOR:        BINARY_OP(xor)
+			case OP_BITAND:        BINARY_OP(and)
+			case OP_SHIFTLEFT:     BINARY_OP(lshift)
+			case OP_SHIFTRIGHT:    BINARY_OP(rshift)
+			case OP_POW:           BINARY_OP(pow)
+			case OP_MATMUL:        BINARY_OP(matmul)
+			case OP_EQUAL:         BINARY_OP(eq);
+			case OP_IS:            BINARY_OP(is);
+			case OP_BITNEGATE:     LIKELY_INT_UNARY_OP(invert,~)
+			case OP_NEGATE:        LIKELY_INT_UNARY_OP(neg,-)
+			case OP_POS:           LIKELY_INT_UNARY_OP(pos,+)
 			case OP_NONE:  krk_push(NONE_VAL()); break;
 			case OP_TRUE:  krk_push(BOOLEAN_VAL(1)); break;
 			case OP_FALSE: krk_push(BOOLEAN_VAL(0)); break;
 			case OP_UNSET: krk_push(KWARGS_VAL(0)); break;
-			case OP_NOT:   krk_push(BOOLEAN_VAL(krk_isFalsey(krk_pop()))); break;
+			case OP_NOT:   krk_currentThread.stackTop[-1] = BOOLEAN_VAL(krk_isFalsey(krk_peek(0))); break;
 			case OP_POP:   krk_pop(); break;
+
+			case OP_INPLACE_ADD:        INPLACE_BINARY_OP(add)
+			case OP_INPLACE_SUBTRACT:   INPLACE_BINARY_OP(sub)
+			case OP_INPLACE_MULTIPLY:   INPLACE_BINARY_OP(mul)
+			case OP_INPLACE_DIVIDE:     INPLACE_BINARY_OP(truediv)
+			case OP_INPLACE_FLOORDIV:   INPLACE_BINARY_OP(floordiv)
+			case OP_INPLACE_MODULO:     INPLACE_BINARY_OP(mod)
+			case OP_INPLACE_BITOR:      INPLACE_BINARY_OP(or)
+			case OP_INPLACE_BITXOR:     INPLACE_BINARY_OP(xor)
+			case OP_INPLACE_BITAND:     INPLACE_BINARY_OP(and)
+			case OP_INPLACE_SHIFTLEFT:  INPLACE_BINARY_OP(lshift)
+			case OP_INPLACE_SHIFTRIGHT: INPLACE_BINARY_OP(rshift)
+			case OP_INPLACE_POW:        INPLACE_BINARY_OP(pow)
+			case OP_INPLACE_MATMUL:     INPLACE_BINARY_OP(matmul)
+
 			case OP_RAISE: {
-				if (IS_CLASS(krk_peek(0))) {
-					krk_currentThread.currentException = krk_callStack(0);
-				} else {
-					krk_currentThread.currentException = krk_pop();
-				}
-				attachTraceback();
-				krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
+				krk_raiseException(krk_peek(0), NONE_VAL());
+				goto _finishException;
+			}
+			case OP_RAISE_FROM: {
+				krk_raiseException(krk_peek(1), krk_peek(0));
 				goto _finishException;
 			}
 			case OP_CLOSE_UPVALUE:
@@ -2559,59 +2260,25 @@ _finishReturn: (void)0;
 				krk_pop();
 				break;
 			case OP_INVOKE_GETTER: {
-				KrkClass * type = krk_getType(krk_peek(1));
-				if (likely(type->_getter != NULL)) {
-					krk_push(krk_callDirect(type->_getter, 2));
-				} else if (IS_CLASS(krk_peek(1)) && AS_CLASS(krk_peek(1))->_classgetitem) {
-					krk_push(krk_callDirect(AS_CLASS(krk_peek(1))->_classgetitem, 2));
-				} else {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not subscriptable", krk_typeName(krk_peek(1)));
-				}
+				commonMethodInvoke(offsetof(KrkClass,_getter), 2, "'%T' object is not subscriptable");
 				break;
 			}
 			case OP_INVOKE_SETTER: {
-				KrkClass * type = krk_getType(krk_peek(2));
-				if (likely(type->_setter != NULL)) {
-					krk_push(krk_callDirect(type->_setter, 3));
-				} else {
-					if (type->_getter) {
-						krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not mutable", krk_typeName(krk_peek(2)));
-					} else {
-						krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not subscriptable", krk_typeName(krk_peek(2)));
-					}
-				}
+				commonMethodInvoke(offsetof(KrkClass,_setter), 3, "'%T' object doesn't support item assignment");
 				break;
 			}
 			case OP_INVOKE_DELETE: {
-				KrkClass * type = krk_getType(krk_peek(1));
-				if (likely(type->_delitem != NULL)) {
-					krk_callDirect(type->_delitem, 2);
-				} else {
-					if (type->_getter) {
-						krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not mutable", krk_typeName(krk_peek(1)));
-					} else {
-						krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not subscriptable", krk_typeName(krk_peek(1)));
-					}
-				}
+				commonMethodInvoke(offsetof(KrkClass,_delitem), 2, "'%T' object doesn't support item deletion");
+				krk_pop(); /* unused result */
 				break;
 			}
 			case OP_INVOKE_ITER: {
-				KrkClass * type = krk_getType(krk_peek(0));
-				if (likely(type->_iter != NULL)) {
-					krk_push(krk_callDirect(type->_iter, 1));
-				} else {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object is not iterable", krk_typeName(krk_peek(0)));
-				}
+				commonMethodInvoke(offsetof(KrkClass,_iter), 1, "'%T' object is not iterable");
 				break;
 			}
 			case OP_INVOKE_CONTAINS: {
-				KrkClass * type = krk_getType(krk_peek(0));
-				if (likely(type->_contains != NULL)) {
-					krk_swap(1);
-					krk_push(krk_callDirect(type->_contains, 2));
-				} else {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object can not be tested for membership", krk_typeName(krk_peek(0)));
-				}
+				krk_swap(1); /* operands are backwards */
+				commonMethodInvoke(offsetof(KrkClass,_contains), 2, "'%T' object can not be tested for membership");
 				break;
 			}
 			case OP_INVOKE_AWAIT: {
@@ -2622,13 +2289,19 @@ _finishReturn: (void)0;
 				KrkClass * _class = AS_CLASS(krk_peek(0));
 				/* Store special methods for quick access */
 				krk_finalizeClass(_class);
+				/* Call __set_name__? */
+				_callSetName(_class);
 				break;
 			}
 			case OP_INHERIT: {
 				KrkValue superclass = krk_peek(0);
 				if (unlikely(!IS_CLASS(superclass))) {
-					krk_runtimeError(vm.exceptions->typeError, "Superclass must be a class, not '%s'",
-						krk_typeName(superclass));
+					krk_runtimeError(vm.exceptions->typeError, "Superclass must be a class, not '%T'", superclass);
+					goto _finishException;
+				}
+				if (AS_OBJECT(superclass)->flags & KRK_OBJ_FLAGS_NO_INHERIT) {
+					krk_runtimeError(vm.exceptions->typeError, "'%S' can not be subclassed",
+						AS_CLASS(superclass)->name);
 					goto _finishException;
 				}
 				KrkClass * subclass = AS_CLASS(krk_peek(1));
@@ -2657,6 +2330,8 @@ _finishReturn: (void)0;
 					isMatch = 0;
 				} else if (AS_HANDLER_TYPE(krk_peek(1)) == OP_END_FINALLY) {
 					isMatch = 0;
+				} else if (AS_HANDLER_TYPE(krk_peek(1)) == OP_EXIT_LOOP) {
+					isMatch = 0;
 				} else if (IS_CLASS(krk_peek(0)) && krk_isInstanceOf(krk_peek(2), AS_CLASS(krk_peek(0)))) {
 					isMatch = 1;
 				} else if (IS_TUPLE(krk_peek(0))) {
@@ -2674,6 +2349,12 @@ _finishReturn: (void)0;
 				}
 				krk_pop();
 				krk_push(BOOLEAN_VAL(isMatch));
+				break;
+			}
+			case OP_TRY_ELSE: {
+				if (IS_HANDLER(krk_peek(0))) {
+					krk_currentThread.stackTop[-1] = HANDLER_VAL(OP_FILTER_EXCEPT,AS_HANDLER_TARGET(krk_peek(0)));
+				}
 				break;
 			}
 			case OP_BEGIN_FINALLY: {
@@ -2694,6 +2375,10 @@ _finishReturn: (void)0;
 						krk_currentThread.currentException = krk_pop();
 						krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
 						goto _finishException;
+					} else if (AS_HANDLER_TYPE(handler) == OP_EXIT_LOOP) {
+						frame->ip = frame->closure->function->chunk.code + AS_HANDLER_TARGET(handler);
+						OPERAND = AS_INTEGER(krk_peek(1));
+						goto _finishPopBlock;
 					} else if (AS_HANDLER_TYPE(handler) == OP_RETURN) {
 						krk_push(krk_peek(1));
 						goto _finishReturn;
@@ -2728,7 +2413,7 @@ _finishReturn: (void)0;
 					krk_swap(1);
 					krk_pop();
 				} else {
-					krk_runtimeError(vm.exceptions->typeError, "Can not annotate '%s'.", krk_typeName(krk_peek(0)));
+					krk_runtimeError(vm.exceptions->typeError, "Can not annotate '%T'.", krk_peek(0));
 					goto _finishException;
 				}
 				break;
@@ -2739,22 +2424,19 @@ _finishReturn: (void)0;
 			 */
 			case OP_JUMP_IF_FALSE_OR_POP: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
-				if (krk_peek(0) == BOOLEAN_VAL(0) || krk_isFalsey(krk_peek(0))) frame->ip += offset;
+				if (krk_peek(0) == BOOLEAN_VAL(0) || krk_isFalsey(krk_peek(0))) frame->ip += OPERAND;
 				else krk_pop();
 				break;
 			}
 			case OP_POP_JUMP_IF_FALSE: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
-				if (krk_peek(0) == BOOLEAN_VAL(0) || krk_isFalsey(krk_peek(0))) frame->ip += offset;
+				if (krk_peek(0) == BOOLEAN_VAL(0) || krk_isFalsey(krk_peek(0))) frame->ip += OPERAND;
 				krk_pop();
 				break;
 			}
 			case OP_JUMP_IF_TRUE_OR_POP: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
-				if (!krk_isFalsey(krk_peek(0))) frame->ip += offset;
+				if (!krk_isFalsey(krk_peek(0))) frame->ip += OPERAND;
 				else krk_pop();
 				break;
 			}
@@ -2765,8 +2447,7 @@ _finishReturn: (void)0;
 			}
 			case OP_LOOP: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
-				frame->ip -= offset;
+				frame->ip -= OPERAND;
 				break;
 			}
 			case OP_PUSH_TRY: {
@@ -2833,21 +2514,24 @@ _finishReturn: (void)0;
 			}
 			case OP_CALL_ITER: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
 				KrkValue iter = krk_peek(0);
 				krk_push(iter);
 				krk_push(krk_callStack(0));
 				/* krk_valuesSame() */
-				if (iter == krk_peek(0)) frame->ip += offset;
+				if (iter == krk_peek(0)) frame->ip += OPERAND;
 				break;
 			}
 			case OP_LOOP_ITER: {
 				TWO_BYTE_OPERAND;
-				uint16_t offset = OPERAND;
 				KrkValue iter = krk_peek(0);
 				krk_push(iter);
 				krk_push(krk_callStack(0));
-				if (iter != krk_peek(0)) frame->ip -= offset;
+				if (iter != krk_peek(0)) frame->ip -= OPERAND;
+				break;
+			}
+			case OP_TEST_ARG: {
+				TWO_BYTE_OPERAND;
+				if (krk_pop() != KWARGS_VAL(0)) frame->ip += OPERAND;
 				break;
 			}
 
@@ -2855,8 +2539,7 @@ _finishReturn: (void)0;
 				THREE_BYTE_OPERAND;
 			case OP_CONSTANT: {
 				ONE_BYTE_OPERAND;
-				size_t index = OPERAND;
-				KrkValue constant = frame->closure->function->chunk.constants.values[index];
+				KrkValue constant = frame->closure->function->chunk.constants.values[OPERAND];
 				krk_push(constant);
 				break;
 			}
@@ -2877,7 +2560,7 @@ _finishReturn: (void)0;
 				KrkValue value;
 				if (!krk_tableGet_fast(frame->globals, name, &value)) {
 					if (!krk_tableGet_fast(&vm.builtins->fields, name, &value)) {
-						krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%s'.", name->chars);
+						krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%S'.", name);
 						goto _finishException;
 					}
 				}
@@ -2889,9 +2572,8 @@ _finishReturn: (void)0;
 			case OP_SET_GLOBAL: {
 				ONE_BYTE_OPERAND;
 				KrkString * name = READ_STRING(OPERAND);
-				if (krk_tableSet(frame->globals, OBJECT_VAL(name), krk_peek(0))) {
-					krk_tableDelete(frame->globals, OBJECT_VAL(name));
-					krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%s'.", name->chars);
+				if (!krk_tableSetIfExists(frame->globals, OBJECT_VAL(name), krk_peek(0))) {
+					krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%S'.", name);
 					goto _finishException;
 				}
 				break;
@@ -2902,7 +2584,7 @@ _finishReturn: (void)0;
 				ONE_BYTE_OPERAND;
 				KrkString * name = READ_STRING(OPERAND);
 				if (!krk_tableDelete(frame->globals, OBJECT_VAL(name))) {
-					krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%s'.", name->chars);
+					krk_runtimeError(vm.exceptions->nameError, "Undefined variable '%S'.", name);
 					goto _finishException;
 				}
 				break;
@@ -2970,7 +2652,7 @@ _finishReturn: (void)0;
 			case OP_CLOSURE: {
 				ONE_BYTE_OPERAND;
 				KrkCodeObject * function = AS_codeobject(READ_CONSTANT(OPERAND));
-				KrkClosure * closure = krk_newClosure(function);
+				KrkClosure * closure = krk_newClosure(function, frame->globalsOwner);
 				krk_push(OBJECT_VAL(closure));
 				for (size_t i = 0; i < closure->upvalueCount; ++i) {
 					int isLocal = READ_BYTE();
@@ -3021,7 +2703,7 @@ _finishReturn: (void)0;
 					/* Try to import... */
 					KrkValue moduleName;
 					if (!krk_tableGet(&AS_INSTANCE(krk_peek(0))->fields, vm.specialMethodNames[METHOD_NAME], &moduleName)) {
-						krk_runtimeError(vm.exceptions->importError, "Can not import '%s' from non-module '%s' object", name->chars, krk_typeName(krk_peek(0)));
+						krk_runtimeError(vm.exceptions->importError, "Can not import '%S' from non-module '%T' object", name, krk_peek(0));
 						goto _finishException;
 					}
 					krk_push(moduleName);
@@ -3030,7 +2712,7 @@ _finishReturn: (void)0;
 					krk_push(OBJECT_VAL(name));
 					krk_addObjects();
 					if (!krk_doRecursiveModuleLoad(AS_STRING(krk_peek(0)))) {
-						krk_runtimeError(vm.exceptions->importError, "Can not import '%s' from '%s'", name->chars, AS_CSTRING(moduleName));
+						krk_runtimeError(vm.exceptions->importError, "Can not import '%S' from '%S'", name, AS_STRING(moduleName));
 						goto _finishException;
 					}
 					krk_currentThread.stackTop[-3] = krk_currentThread.stackTop[-1];
@@ -3043,7 +2725,7 @@ _finishReturn: (void)0;
 				ONE_BYTE_OPERAND;
 				KrkString * name = READ_STRING(OPERAND);
 				if (unlikely(!valueGetProperty(name))) {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(0)), name->chars);
+					krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%S'", krk_peek(0), name);
 					goto _finishException;
 				}
 				break;
@@ -3054,7 +2736,7 @@ _finishReturn: (void)0;
 				ONE_BYTE_OPERAND;
 				KrkString * name = READ_STRING(OPERAND);
 				if (unlikely(!valueDelProperty(name))) {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(0)), name->chars);
+					krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%S'", krk_peek(0), name);
 					goto _finishException;
 				}
 				break;
@@ -3065,7 +2747,7 @@ _finishReturn: (void)0;
 				ONE_BYTE_OPERAND;
 				KrkString * name = READ_STRING(OPERAND);
 				if (unlikely(!valueSetProperty(name))) {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(1)), name->chars);
+					krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%S'", krk_peek(1), name);
 					goto _finishException;
 				}
 				break;
@@ -3079,7 +2761,7 @@ _finishReturn: (void)0;
 				KrkValue name = OBJECT_VAL(READ_STRING(OPERAND));
 				krk_tableSet(&_class->methods, name, method);
 				if (AS_STRING(name) == S("__class_getitem__") && IS_CLOSURE(method)) {
-					AS_CLOSURE(method)->flags |= KRK_FUNCTION_FLAGS_IS_CLASS_METHOD;
+					AS_CLOSURE(method)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD;
 				}
 				krk_pop();
 				break;
@@ -3092,7 +2774,7 @@ _finishReturn: (void)0;
 				KrkValue baseClass = krk_peek(1);
 				if (!IS_CLASS(baseClass)) {
 					krk_runtimeError(vm.exceptions->typeError,
-						"super() argument 1 must be class, not %s", krk_typeName(baseClass));
+						"super() argument 1 must be class, not %T", baseClass);
 					goto _finishException;
 				}
 				if (IS_KWARGS(krk_peek(0))) {
@@ -3102,14 +2784,14 @@ _finishReturn: (void)0;
 				}
 				if (!krk_isInstanceOf(krk_peek(0), AS_CLASS(baseClass))) {
 					krk_runtimeError(vm.exceptions->typeError,
-						"'%s' object is not an instance of '%s'",
-						krk_typeName(krk_peek(0)), AS_CLASS(baseClass)->name->chars);
+						"'%T' object is not an instance of '%S'",
+						krk_peek(0), AS_CLASS(baseClass)->name);
 					goto _finishException;
 				}
 				KrkClass * superclass = AS_CLASS(baseClass)->base ? AS_CLASS(baseClass)->base : vm.baseClasses->objectClass;
 				if (!krk_bindMethod(superclass, name)) {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'",
-						superclass->name->chars, name->chars);
+					krk_runtimeError(vm.exceptions->attributeError, "'%S' object has no attribute '%S'",
+						superclass->name, name);
 					goto _finishException;
 				}
 				/* Swap bind and superclass */
@@ -3129,7 +2811,7 @@ _finishReturn: (void)0;
 					krk_swap(2);
 					krk_pop();
 				} else if (unlikely(!result)) {
-					krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", krk_typeName(krk_peek(0)), name->chars);
+					krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%S'", krk_peek(0), name);
 					goto _finishException;
 				} else {
 					krk_swap(1); /* unbound-method object */
@@ -3153,74 +2835,89 @@ _finishReturn: (void)0;
 				THREE_BYTE_OPERAND;
 			case OP_CLOSE_MANY: {
 				ONE_BYTE_OPERAND;
-				for (int i = 0; i < OPERAND; ++i) {
-					closeUpvalues((krk_currentThread.stackTop - krk_currentThread.stack)-1);
+				closeUpvalues((krk_currentThread.stackTop - krk_currentThread.stack) - OPERAND);
+				for (unsigned int i = 0; i < OPERAND; ++i) {
 					krk_pop();
 				}
 				break;
 			}
+
+			case OP_EXIT_LOOP_LONG:
+				THREE_BYTE_OPERAND;
+			case OP_EXIT_LOOP: {
+				ONE_BYTE_OPERAND;
+_finishPopBlock:
+				closeUpvalues(frame->slots + OPERAND);
+				int stackOffset;
+				for (stackOffset = (int)(krk_currentThread.stackTop - krk_currentThread.stack - 1);
+					stackOffset >= (int)(frame->slots + OPERAND) && 
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_PUSH_TRY) &&
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_PUSH_WITH) &&
+					!IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset],OP_FILTER_EXCEPT)
+					; stackOffset--) krk_pop();
+
+				/* Do the handler. */
+				if (stackOffset >= (int)(frame->slots + OPERAND)) {
+					uint16_t popTarget = (frame->ip - frame->closure->function->chunk.code);
+					krk_currentThread.stackTop = &krk_currentThread.stack[stackOffset + 1];
+					frame->ip = frame->closure->function->chunk.code + AS_HANDLER_TARGET(krk_peek(0));
+					krk_currentThread.stackTop[-1] = HANDLER_VAL(OP_EXIT_LOOP, popTarget);
+					krk_currentThread.stackTop[-2] = INTEGER_VAL(OPERAND);
+				}
+
+				/* Continue normally */
+				break;
+			}
+
 			case OP_POP_MANY_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_POP_MANY: {
 				ONE_BYTE_OPERAND;
-				for (int i = 0; i < OPERAND; ++i) {
+				for (unsigned int i = 0; i < OPERAND; ++i) {
 					krk_pop();
 				}
 				break;
 			}
-#define doMake(func) { \
-	size_t count = OPERAND; \
-	KrkValue collection = krk_callNativeOnStack(func, count, &krk_currentThread.stackTop[-count], 0); \
-	if (count) { \
-		krk_currentThread.stackTop[-count] = collection; \
-		while (count > 1) { \
-			krk_pop(); count--; \
-		} \
-	} else { \
-		krk_push(collection); \
-	} \
-}
 			case OP_TUPLE_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_TUPLE: {
 				ONE_BYTE_OPERAND;
-				doMake(krk_tuple_of);
+				makeCollection(krk_tuple_of, OPERAND);
 				break;
 			}
 			case OP_MAKE_LIST_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_MAKE_LIST: {
 				ONE_BYTE_OPERAND;
-				doMake(krk_list_of);
+				makeCollection(krk_list_of, OPERAND);
 				break;
 			}
 			case OP_MAKE_DICT_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_MAKE_DICT: {
 				ONE_BYTE_OPERAND;
-				doMake(krk_dict_of);
+				makeCollection(krk_dict_of, OPERAND);
 				break;
 			}
 			case OP_MAKE_SET_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_MAKE_SET: {
 				ONE_BYTE_OPERAND;
-				doMake(krk_set_of);
+				makeCollection(krk_set_of, OPERAND);
 				break;
 			}
 			case OP_SLICE_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_SLICE: {
 				ONE_BYTE_OPERAND;
-				doMake(krk_slice_of);
+				makeCollection(krk_slice_of, OPERAND);
 				break;
 			}
 			case OP_LIST_APPEND_LONG:
 				THREE_BYTE_OPERAND;
 			case OP_LIST_APPEND: {
 				ONE_BYTE_OPERAND;
-				uint32_t slot = OPERAND;
-				KrkValue list = krk_currentThread.stack[frame->slots + slot];
+				KrkValue list = krk_currentThread.stack[frame->slots + OPERAND];
 				FUNC_NAME(list,append)(2,(KrkValue[]){list,krk_peek(0)},0);
 				krk_pop();
 				break;
@@ -3229,8 +2926,7 @@ _finishReturn: (void)0;
 				THREE_BYTE_OPERAND;
 			case OP_DICT_SET: {
 				ONE_BYTE_OPERAND;
-				uint32_t slot = OPERAND;
-				KrkValue dict = krk_currentThread.stack[frame->slots + slot];
+				KrkValue dict = krk_currentThread.stack[frame->slots + OPERAND];
 				FUNC_NAME(dict,__setitem__)(3,(KrkValue[]){dict,krk_peek(1),krk_peek(0)},0);
 				krk_pop();
 				krk_pop();
@@ -3240,8 +2936,7 @@ _finishReturn: (void)0;
 				THREE_BYTE_OPERAND;
 			case OP_SET_ADD: {
 				ONE_BYTE_OPERAND;
-				uint32_t slot = OPERAND;
-				KrkValue set = krk_currentThread.stack[frame->slots + slot];
+				KrkValue set = krk_currentThread.stack[frame->slots + OPERAND];
 				FUNC_NAME(set,add)(2,(KrkValue[]){set,krk_peek(0)},0);
 				krk_pop();
 				break;
@@ -3251,7 +2946,7 @@ _finishReturn: (void)0;
 			case OP_REVERSE: {
 				ONE_BYTE_OPERAND;
 				krk_push(NONE_VAL()); /* Storage space */
-				for (int i = 0; i < OPERAND / 2; ++i) {
+				for (ssize_t i = 0; i < OPERAND / 2; ++i) {
 					krk_currentThread.stackTop[-1] = krk_currentThread.stackTop[-i-2];
 					krk_currentThread.stackTop[-i-2] = krk_currentThread.stackTop[-(OPERAND-i)-1];
 					krk_currentThread.stackTop[-(OPERAND-i)-1] = krk_currentThread.stackTop[-1];
@@ -3263,74 +2958,73 @@ _finishReturn: (void)0;
 				THREE_BYTE_OPERAND;
 			case OP_UNPACK: {
 				ONE_BYTE_OPERAND;
-				size_t count = OPERAND;
 				KrkValue sequence = krk_peek(0);
-				/* First figure out what it is and if we can unpack it. */
-#define unpackArray(counter, indexer) do { \
-					if (counter != count) { \
-						krk_runtimeError(vm.exceptions->valueError, "Wrong number of values to unpack (wanted %d, got %d)", (int)count, (int)counter); \
-						break; \
-					} \
-					for (size_t i = 1; i < counter; ++i) { \
-						krk_push(indexer); \
-					} \
-					size_t i = 0; \
-					krk_currentThread.stackTop[-count] = indexer; \
-				} while (0)
-				if (IS_TUPLE(sequence)) {
-					unpackArray(AS_TUPLE(sequence)->values.count, AS_TUPLE(sequence)->values.values[i]);
-				} else if (IS_INSTANCE(sequence) && AS_INSTANCE(sequence)->_class == vm.baseClasses->listClass) {
-					unpackArray(AS_LIST(sequence)->count, AS_LIST(sequence)->values[i]);
-				} else if (IS_INSTANCE(sequence) && AS_INSTANCE(sequence)->_class == vm.baseClasses->dictClass) {
-					unpackArray(AS_DICT(sequence)->count, krk_dict_nth_key_fast(AS_DICT(sequence)->capacity, AS_DICT(sequence)->entries, i));
-				} else if (IS_STRING(sequence)) {
-					unpackArray(AS_STRING(sequence)->codesLength, krk_string_get(2,(KrkValue[]){sequence,INTEGER_VAL(i)},0));
-				} else {
-					KrkClass * type = krk_getType(sequence);
-					if (!type->_iter) {
-						krk_runtimeError(vm.exceptions->typeError, "'%s' object is not iterable", krk_typeName(sequence));
-						goto _finishException;
-					} else {
-						size_t stackStart = krk_currentThread.stackTop - krk_currentThread.stack - 1;
-						size_t counter = 0;
-						for (size_t i = 0; i < count-1; i++) {
-							krk_push(NONE_VAL());
-						}
-						/* Create the iterator */
-						krk_push(krk_currentThread.stack[stackStart]);
-						krk_push(krk_callDirect(type->_iter, 1));
-
-						do {
-							/* Call it until it gives us itself */
-							krk_push(krk_currentThread.stackTop[-1]);
-							krk_push(krk_callStack(0));
-							if (krk_valuesSame(krk_currentThread.stackTop[-2], krk_currentThread.stackTop[-1])) {
-								/* We're done. */
-								krk_pop(); /* The result of iteration */
-								krk_pop(); /* The iterator */
-								if (counter != count) {
-									krk_runtimeError(vm.exceptions->valueError, "Wrong number of values to unpack (wanted %d, got %d)", (int)count, (int)counter);
-									goto _finishException;
-								}
-								break;
-							}
-							if (counter == count) {
-								krk_runtimeError(vm.exceptions->valueError, "Wrong number of values to unpack (wanted %d, got %d)", (int)count, (int)counter);
-								goto _finishException;
-							}
-							/* Rotate */
-							krk_currentThread.stack[stackStart+counter] = krk_pop();
-							counter++;
-						} while (1);
-					}
+				KrkTuple * values = krk_newTuple(OPERAND);
+				krk_push(OBJECT_VAL(values));
+				if (unlikely(krk_unpackIterable(sequence, values, _unpack_op))) {
+					goto _finishException;
 				}
-#undef unpackArray
+				if (unlikely(values->values.count != OPERAND)) {
+					krk_runtimeError(vm.exceptions->valueError, "not enough values to unpack (expected %u, got %zu)", OPERAND, values->values.count);
+					goto _finishException;
+				}
+				if (unlikely(OPERAND == 0)) {
+					krk_pop();
+					krk_pop();
+					break;
+				}
+				/* We no longer need the sequence */
+				krk_swap(1);
+				krk_pop();
+				for (size_t i = 1; i < values->values.count; ++i) {
+					krk_push(values->values.values[i]);
+				}
+				krk_currentThread.stackTop[-(ssize_t)OPERAND] = values->values.values[0];
 				break;
 			}
+
+			case OP_FORMAT_VALUE_LONG:
+				THREE_BYTE_OPERAND;
+			case OP_FORMAT_VALUE: {
+				ONE_BYTE_OPERAND;
+				if (doFormatString(OPERAND)) goto _finishException;
+				break;
+			}
+
+			case OP_MAKE_STRING_LONG:
+				THREE_BYTE_OPERAND;
+			case OP_MAKE_STRING: {
+				ONE_BYTE_OPERAND;
+
+				struct StringBuilder sb = {0};
+
+				for (ssize_t i = 0; i < OPERAND; ++i) {
+					KrkValue s = krk_currentThread.stackTop[-(ssize_t)OPERAND+i];
+					if (unlikely(!IS_STRING(s))) {
+						discardStringBuilder(&sb);
+						krk_runtimeError(vm.exceptions->valueError, "'%T' is not a string", s);
+						goto _finishException;
+					}
+					pushStringBuilderStr(&sb, (char*)AS_STRING(s)->chars, AS_STRING(s)->length);
+				}
+
+				for (ssize_t i = 0; i < OPERAND; ++i) {
+					krk_pop();
+				}
+
+				krk_push(finishStringBuilder(&sb));
+				break;
+			}
+
+			default:
+				__builtin_unreachable();
 		}
 		if (unlikely(krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) {
 _finishException:
 			if (!handleException()) {
+				if (!IS_NONE(krk_currentThread.stackTop[-2])) {
+					krk_attachInnerException(krk_currentThread.stackTop[-2]);
+				}
 				frame = &krk_currentThread.frames[krk_currentThread.frameCount - 1];
 				frame->ip = frame->closure->function->chunk.code + AS_HANDLER_TARGET(krk_peek(0));
 				/* Stick the exception into the exception slot */
@@ -3385,22 +3079,14 @@ KrkValue krk_interpret(const char * src, char * fromFile) {
 
 	krk_push(OBJECT_VAL(function));
 	krk_attachNamedObject(&krk_currentThread.module->fields, "__file__", (KrkObj*)function->chunk.filename);
-
-	KrkClosure * closure = krk_newClosure(function);
+	KrkClosure * closure = krk_newClosure(function, OBJECT_VAL(krk_currentThread.module));
 	krk_pop();
 
 	krk_push(OBJECT_VAL(closure));
-
-	/* Quick little kludge so that empty statements return None from REPLs */
-	krk_push(NONE_VAL());
-	krk_pop();
-
-	krk_callValue(OBJECT_VAL(closure), 0, 1);
-
-	return run();
+	return krk_callStack(0);
 }
 
-#ifndef NO_FILESYSTEM
+#ifndef KRK_NO_FILESYSTEM
 KrkValue krk_runfile(const char * fileName, char * fromFile) {
 	FILE * f = fopen(fileName,"r");
 	if (!f) {
@@ -3426,11 +3112,4 @@ KrkValue krk_runfile(const char * fileName, char * fromFile) {
 	return result;
 }
 
-KrkValue krk_callfile(const char * fileName, char * fromFile) {
-	int previousExitFrame = krk_currentThread.exitOnFrame;
-	krk_currentThread.exitOnFrame = krk_currentThread.frameCount;
-	KrkValue out = krk_runfile(fileName, fromFile);
-	krk_currentThread.exitOnFrame = previousExitFrame;
-	return out;
-}
 #endif

@@ -15,48 +15,47 @@ struct ByteArray {
 
 #undef IS_bytes
 #define IS_bytes(o) (IS_BYTES(o) || krk_isInstanceOf(o, vm.baseClasses->bytesClass))
-KRK_METHOD(bytes,__init__,{
-	if (argc < 2) {
-		return OBJECT_VAL(krk_newBytes(0,NULL));
+
+static int _bytes_callback(void * context, const KrkValue * values, size_t count) {
+	struct StringBuilder * sb = context;
+	for (size_t i = 0; i < count; ++i) {
+		if (!IS_INTEGER(values[i])) {
+			krk_runtimeError(vm.exceptions->typeError, "'%T' is not an integer", values[i]);
+			return 1;
+		}
+		if (AS_INTEGER(values[i]) < 0 || AS_INTEGER(values[i]) > 255) {
+			krk_runtimeError(vm.exceptions->typeError, "bytes object must be in range(0, 256)");
+			return 1;
+		}
+		pushStringBuilder(sb, AS_INTEGER(values[i]));
 	}
+	return 0;
+}
+
+KRK_Method(bytes,__init__) {
+	if (argc < 2) return OBJECT_VAL(krk_newBytes(0,NULL));
 	METHOD_TAKES_AT_MOST(1);
 
-	/* TODO: Use generic unpacker */
-	if (IS_TUPLE(argv[1])) {
-		KrkBytes * out = krk_newBytes(AS_TUPLE(argv[1])->values.count, NULL);
-		krk_push(OBJECT_VAL(out));
-		for (size_t i = 0; i < AS_TUPLE(argv[1])->values.count; ++i) {
-			if (!IS_INTEGER(AS_TUPLE(argv[1])->values.values[i])) {
-				return krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'",
-					"bytes", "tuple of ints", krk_typeName(AS_TUPLE(argv[1])->values.values[i]));
-			}
-			out->bytes[i] = AS_INTEGER(AS_TUPLE(argv[1])->values.values[i]);
-		}
-		return krk_pop();
-	} else if (IS_list(argv[1])) {
-		KrkBytes * out = krk_newBytes(AS_LIST(argv[1])->count, NULL);
-		krk_push(OBJECT_VAL(out));
-		for (size_t i = 0; i < AS_LIST(argv[1])->count; ++i) {
-			if (!IS_INTEGER(AS_LIST(argv[1])->values[i])) {
-				return krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'",
-					"bytes", "list of ints", krk_typeName(AS_LIST(argv[1])->values[i]));
-			}
-			out->bytes[i] = AS_INTEGER(AS_LIST(argv[1])->values[i]);
-		}
-		return krk_pop();
-	} else if (IS_bytearray(argv[1])) {
+	if (IS_bytearray(argv[1])) {
 		return OBJECT_VAL(krk_newBytes(
 			AS_BYTES(AS_bytearray(argv[1])->actual)->length,
 			AS_BYTES(AS_bytearray(argv[1])->actual)->bytes));
+	} else if (IS_STRING(argv[1])) {
+		return OBJECT_VAL(krk_newBytes(AS_STRING(argv[1])->length, (uint8_t*)AS_CSTRING(argv[1])));
+	} else if (IS_INTEGER(argv[1])) {
+		if (AS_INTEGER(argv[1]) < 0) return krk_runtimeError(vm.exceptions->valueError, "negative count");
+		return OBJECT_VAL(krk_newBytes(AS_INTEGER(argv[1]),NULL));
+	} else {
+		struct StringBuilder sb = {0};
+		if (krk_unpackIterable(argv[1], &sb, _bytes_callback)) return NONE_VAL();
+		return finishStringBuilderBytes(&sb);
 	}
-
-	return krk_runtimeError(vm.exceptions->typeError, "Can not convert '%s' to bytes", krk_typeName(argv[1]));
-})
+}
 
 #undef IS_bytes
 #define IS_bytes(o) IS_BYTES(o)
 
-KRK_METHOD(bytes,__hash__,{
+KRK_Method(bytes,__hash__) {
 	METHOD_TAKES_NONE();
 	uint32_t hash = 0;
 	/* This is the so-called "sdbm" hash. It comes from a piece of
@@ -65,12 +64,11 @@ KRK_METHOD(bytes,__hash__,{
 		hash = (int)self->bytes[i] + (hash << 6) + (hash << 16) - hash;
 	}
 	return INTEGER_VAL(hash);
-})
+}
 
 /* bytes objects are not interned; need to do this the old-fashioned way. */
-KRK_METHOD(bytes,__eq__,{
+KRK_Method(bytes,__eq__) {
 	if (!IS_BYTES(argv[1])) return BOOLEAN_VAL(0);
-	KrkBytes * self = AS_BYTES(argv[0]);
 	KrkBytes * them = AS_BYTES(argv[1]);
 	if (self->length != them->length) return BOOLEAN_VAL(0);
 	if (self->obj.hash != them->obj.hash) return BOOLEAN_VAL(0);
@@ -78,11 +76,11 @@ KRK_METHOD(bytes,__eq__,{
 		if (self->bytes[i] != them->bytes[i]) return BOOLEAN_VAL(0);
 	}
 	return BOOLEAN_VAL(1);
-})
+}
 
 #define AT_END() (self->length == 0 || i == self->length - 1)
 
-KRK_METHOD(bytes,__repr__,{
+KRK_Method(bytes,__repr__) {
 	struct StringBuilder sb = {0};
 
 	pushStringBuilder(&sb, 'b');
@@ -119,9 +117,9 @@ KRK_METHOD(bytes,__repr__,{
 	pushStringBuilder(&sb, '\'');
 
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(bytes,__getitem__,{
+KRK_Method(bytes,__getitem__) {
 	METHOD_TAKES_EXACTLY(1);
 
 	if (IS_INTEGER(argv[1])) {
@@ -154,51 +152,83 @@ KRK_METHOD(bytes,__getitem__,{
 	} else {
 		return TYPE_ERROR(int or slice, argv[1]);
 	}
-})
+}
 
-KRK_METHOD(bytes,__len__,{
+KRK_Method(bytes,__len__) {
 	return INTEGER_VAL(AS_BYTES(argv[0])->length);
-})
+}
 
-KRK_METHOD(bytes,__contains__,{
+KRK_Method(bytes,__contains__) {
 	METHOD_TAKES_EXACTLY(1);
-	return krk_runtimeError(vm.exceptions->notImplementedError, "not implemented");
-})
 
-KRK_METHOD(bytes,decode,{
+	if (IS_BYTES(argv[1])) {
+		return krk_runtimeError(vm.exceptions->notImplementedError, "not implemented: bytes.__contains__(bytes)");
+	}
+
+	if (!IS_INTEGER(argv[1])) {
+		return TYPE_ERROR(int,argv[1]);
+	}
+
+	krk_integer_type val = AS_INTEGER(argv[1]);
+	if (val < 0 || val > 255) {
+		return krk_runtimeError(vm.exceptions->valueError, "byte must be in range(0, 256)");
+	}
+
+	for (size_t i = 0; i < self->length; ++i) {
+		if (self->bytes[i] == val) return BOOLEAN_VAL(1);
+	}
+
+	return BOOLEAN_VAL(0);
+}
+
+KRK_Method(bytes,decode) {
 	METHOD_TAKES_NONE();
 	return OBJECT_VAL(krk_copyString((char*)AS_BYTES(argv[0])->bytes, AS_BYTES(argv[0])->length));
-})
+}
 
-#define unpackArray(counter, indexer) do { \
-	for (size_t i = 0; i < counter; ++i) { \
-		if (!IS_BYTES(indexer)) { errorStr = krk_typeName(indexer); goto _expectedBytes; } \
-		krk_push(indexer); \
-		if (i > 0) pushStringBuilderStr(&sb, (char*)self->bytes, self->length); \
-		pushStringBuilderStr(&sb, (char*)AS_BYTES(indexer)->bytes, AS_BYTES(indexer)->length); \
-		krk_pop(); \
-	} \
-} while (0)
+struct _bytes_join_context {
+	struct StringBuilder * sb;
+	KrkBytes * self;
+	int isFirst;
+};
 
-KRK_METHOD(bytes,join,{
+static int _bytes_join_callback(void * context, const KrkValue * values, size_t count) {
+	struct _bytes_join_context * _context = context;
+
+	for (size_t i = 0; i < count; ++i) {
+		if (!IS_BYTES(values[i])) {
+			krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%T'",
+				"join", "bytes", values[i]);
+			return 1;
+		}
+
+		if (_context->isFirst) {
+			_context->isFirst = 0;
+		} else {
+			pushStringBuilderStr(_context->sb, (char*)_context->self->bytes, _context->self->length);
+		}
+		pushStringBuilderStr(_context->sb, (char*)AS_BYTES(values[i])->bytes, AS_BYTES(values[i])->length);
+	}
+
+	return 0;
+}
+
+KRK_Method(bytes,join) {
 	METHOD_TAKES_EXACTLY(1);
 
-	const char * errorStr = NULL;
 	struct StringBuilder sb = {0};
 
-	unpackIterableFast(argv[1]);
+	struct _bytes_join_context context = {&sb, self, 1};
+
+	if (krk_unpackIterable(argv[1], &context, _bytes_join_callback)) {
+		discardStringBuilder(&sb);
+		return NONE_VAL();
+	}
 
 	return finishStringBuilderBytes(&sb);
+}
 
-_expectedBytes:
-	krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'",
-		"join", "bytes", errorStr);
-	discardStringBuilder(&sb);
-})
-
-#undef unpackArray
-
-KRK_METHOD(bytes,__add__,{
+KRK_Method(bytes,__add__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,bytes,KrkBytes*,them);
 
@@ -207,11 +237,11 @@ KRK_METHOD(bytes,__add__,{
 	pushStringBuilderStr(&sb, (char*)them->bytes, them->length);
 
 	return finishStringBuilderBytes(&sb);
-})
+}
 
 FUNC_SIG(bytesiterator,__init__);
 
-KRK_METHOD(bytes,__iter__,{
+KRK_Method(bytes,__iter__) {
 	METHOD_TAKES_NONE();
 	KrkInstance * output = krk_newInstance(vm.baseClasses->bytesiteratorClass);
 
@@ -220,7 +250,7 @@ KRK_METHOD(bytes,__iter__,{
 	krk_pop();
 
 	return OBJECT_VAL(output);
-})
+}
 
 #undef CURRENT_CTYPE
 
@@ -238,24 +268,24 @@ static void _bytesiterator_gcscan(KrkInstance * self) {
 	krk_markValue(((struct BytesIterator*)self)->l);
 }
 
-KRK_METHOD(bytesiterator,__init__,{
+KRK_Method(bytesiterator,__init__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,bytes,KrkBytes*,bytes);
 	self->l = argv[1];
 	self->i = 0;
 	return argv[0];
-})
+}
 
-KRK_METHOD(bytesiterator,__call__,{
+KRK_Method(bytesiterator,__call__) {
 	KrkValue _list = self->l;
 	size_t _counter = self->i;
-	if (_counter >= AS_BYTES(_list)->length) {
+	if (!IS_BYTES(_list) || _counter >= AS_BYTES(_list)->length) {
 		return argv[0];
 	} else {
 		self->i = _counter + 1;
 		return INTEGER_VAL(AS_BYTES(_list)->bytes[_counter]);
 	}
-})
+}
 
 #undef CURRENT_CTYPE
 #define CURRENT_CTYPE struct ByteArray *
@@ -264,7 +294,7 @@ static void _bytearray_gcscan(KrkInstance * self) {
 	krk_markValue(((struct ByteArray*)self)->actual);
 }
 
-KRK_METHOD(bytearray,__init__,{
+KRK_Method(bytearray,__init__) {
 	METHOD_TAKES_AT_MOST(1);
 	if (argc < 2) {
 		self->actual = OBJECT_VAL(krk_newBytes(0,NULL));
@@ -276,28 +306,36 @@ KRK_METHOD(bytearray,__init__,{
 		return krk_runtimeError(vm.exceptions->valueError, "expected bytes");
 	}
 	return argv[0];
-})
+}
+
+#undef IS_bytearray
+#define IS_bytearray(o) (krk_isInstanceOf(o,vm.baseClasses->bytearrayClass) && IS_BYTES(AS_bytearray(o)->actual))
 
 /* bytes objects are not interned; need to do this the old-fashioned way. */
-KRK_METHOD(bytearray,__eq__,{
+KRK_Method(bytearray,__eq__) {
 	if (!IS_bytearray(argv[1])) return BOOLEAN_VAL(0);
 	struct ByteArray * them = AS_bytearray(argv[1]);
 	return BOOLEAN_VAL(krk_valuesEqual(self->actual, them->actual));
-})
+}
 
-KRK_METHOD(bytearray,__repr__,{
+KRK_Method(bytearray,__repr__) {
 	METHOD_TAKES_NONE();
 	struct StringBuilder sb = {0};
 	pushStringBuilderStr(&sb, "bytearray(", 10);
 
 	krk_push(self->actual);
 	KrkValue repred_bytes = krk_callDirect(vm.baseClasses->bytesClass->_reprer, 1);
+	if (!IS_STRING(repred_bytes)) {
+		/* Invalid repr of bytes? */
+		discardStringBuilder(&sb);
+		return NONE_VAL();
+	}
 	pushStringBuilderStr(&sb, AS_STRING(repred_bytes)->chars, AS_STRING(repred_bytes)->length);
 	pushStringBuilder(&sb,')');
 	return finishStringBuilder(&sb);
-})
+}
 
-KRK_METHOD(bytearray,__getitem__,{
+KRK_Method(bytearray,__getitem__) {
 	METHOD_TAKES_EXACTLY(1);
 
 	if (IS_INTEGER(argv[1])) {
@@ -330,9 +368,9 @@ KRK_METHOD(bytearray,__getitem__,{
 	} else {
 		return TYPE_ERROR(int or slice, argv[1]);
 	}
-})
+}
 
-KRK_METHOD(bytearray,__setitem__,{
+KRK_Method(bytearray,__setitem__) {
 	METHOD_TAKES_EXACTLY(2);
 	CHECK_ARG(1,int,krk_integer_type,asInt);
 	CHECK_ARG(2,int,krk_integer_type,val);
@@ -344,27 +382,27 @@ KRK_METHOD(bytearray,__setitem__,{
 	AS_BYTES(self->actual)->bytes[asInt] = val;
 
 	return INTEGER_VAL(AS_BYTES(self->actual)->bytes[asInt]);
-})
+}
 
-KRK_METHOD(bytearray,__len__,{
+KRK_Method(bytearray,__len__) {
 	return INTEGER_VAL(AS_BYTES(self->actual)->length);
-})
+}
 
-KRK_METHOD(bytearray,__contains__,{
+KRK_Method(bytearray,__contains__) {
 	METHOD_TAKES_EXACTLY(1);
 	CHECK_ARG(1,int,krk_integer_type,val);
 	for (size_t i = 0; i < AS_BYTES(self->actual)->length; ++i) {
 		if (AS_BYTES(self->actual)->bytes[i] == val) return BOOLEAN_VAL(1);
 	}
 	return BOOLEAN_VAL(0);
-})
+}
 
-KRK_METHOD(bytearray,decode,{
+KRK_Method(bytearray,decode) {
 	METHOD_TAKES_NONE();
 	return OBJECT_VAL(krk_copyString((char*)AS_BYTES(self->actual)->bytes, AS_BYTES(self->actual)->length));
-})
+}
 
-KRK_METHOD(bytearray,__iter__,{
+KRK_Method(bytearray,__iter__) {
 	METHOD_TAKES_NONE();
 	KrkInstance * output = krk_newInstance(vm.baseClasses->bytesiteratorClass);
 
@@ -373,12 +411,13 @@ KRK_METHOD(bytearray,__iter__,{
 	krk_pop();
 
 	return OBJECT_VAL(output);
-})
+}
 
 
 _noexport
 void _createAndBind_bytesClass(void) {
 	KrkClass * bytes = ADD_BASE_CLASS(vm.baseClasses->bytesClass, "bytes", vm.baseClasses->objectClass);
+	bytes->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
 	KRK_DOC(BIND_METHOD(bytes,__init__),
 		"@brief An array of bytes.\n"
 		"@arguments iter=None\n\n"
@@ -398,6 +437,7 @@ void _createAndBind_bytesClass(void) {
 	krk_finalizeClass(bytes);
 
 	KrkClass * bytesiterator = ADD_BASE_CLASS(vm.baseClasses->bytesiteratorClass, "bytesiterator", vm.baseClasses->objectClass);
+	bytesiterator->obj.flags |= KRK_OBJ_FLAGS_NO_INHERIT;
 	bytesiterator->allocSize = sizeof(struct BytesIterator);
 	bytesiterator->_ongcscan = _bytesiterator_gcscan;
 	BIND_METHOD(bytesiterator,__init__);

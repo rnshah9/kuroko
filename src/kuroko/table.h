@@ -80,7 +80,7 @@ extern void krk_tableAddAll(KrkTable * from, KrkTable * to);
  * @param hash    Precalculated hash value for the string.
  * @return If the string was found, the string object representation, else NULL.
  */
-extern KrkString * krk_tableFindString(KrkTable * table, const char * chars, size_t length, uint32_t hash);
+extern struct KrkString * krk_tableFindString(KrkTable * table, const char * chars, size_t length, uint32_t hash);
 
 /**
  * @brief Assign a value to a key in a table.
@@ -125,7 +125,7 @@ extern int krk_tableGet(KrkTable * table, KrkValue key, KrkValue * value);
  * @param value Output pointer to place resulting value in.
  * @return 0 if the key was not found, 1 if it was.
  */
-extern int krk_tableGet_fast(KrkTable * table, KrkString * str, KrkValue * value);
+extern int krk_tableGet_fast(KrkTable * table, struct KrkString * str, KrkValue * value);
 
 /**
  * @brief Remove a key from a hash table.
@@ -139,6 +139,19 @@ extern int krk_tableGet_fast(KrkTable * table, KrkString * str, KrkValue * value
  * @return 1 if the value was found and deleted, 0 if it was not present.
  */
 extern int krk_tableDelete(KrkTable * table, KrkValue key);
+
+/**
+ * @brief Remove a key from a hash table, with identity lookup.
+ * @memberof KrkTable
+ *
+ * Scans the table 'table' for the key 'key' and, if found, removes
+ * the entry, replacing it with a tombstone value.
+ *
+ * @param table Table to delete from.
+ * @param key   Key to delete.
+ * @return 1 if the value was found and deleted, 0 if it was not present.
+ */
+extern int krk_tableDeleteExact(KrkTable * table, KrkValue key);
 
 /**
  * @brief Internal table scan function.
@@ -177,3 +190,19 @@ extern int krk_hashValue(KrkValue value, uint32_t *hashOut);
  * @param capacity Target capacity.
  */
 extern void krk_tableAdjustCapacity(KrkTable * table, size_t capacity);
+
+/**
+ * @brief Update the value of a table entry only if it is found.
+ * @memberof KrkTable
+ *
+ * Searches the table for @p key and updates its value to @p value if found.
+ * If @p key is not found, it is not added to the table.
+ *
+ * @warning Note the return value of this function is inverted from krk_tableSet
+ *
+ * @param table Table to assign to.
+ * @param key   Key to assign.
+ * @param value Value to assign to the key.
+ * @return 0 if the key was not present, 1 if it was found and updated.
+ */
+extern int krk_tableSetIfExists(KrkTable * table, KrkValue key, KrkValue value);

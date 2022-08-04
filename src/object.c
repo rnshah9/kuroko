@@ -11,7 +11,7 @@
 #define ALLOCATE_OBJECT(type, objectType) \
 	(type*)allocateObject(sizeof(type), objectType)
 
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 static volatile int _stringLock = 0;
 static volatile int _objectLock = 0;
 #endif
@@ -58,7 +58,7 @@ size_t krk_codepointToBytes(krk_integer_type value, unsigned char * out) {
 #define UTF8_REJECT 1
 
 static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
-	static int state_table[32] = {
+	static const int state_table[32] = {
 		0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 0xxxxxxx */
 		1,1,1,1,1,1,1,1,                 /* 10xxxxxx */
 		2,2,2,2,                         /* 110xxxxx */
@@ -67,7 +67,7 @@ static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
 		1                                /* 11111xxx */
 	};
 
-	static int mask_bytes[32] = {
+	static const int mask_bytes[32] = {
 		0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,
 		0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,0x7F,
 		0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
@@ -77,7 +77,7 @@ static inline uint32_t decode(uint32_t* state, uint32_t* codep, uint32_t byte) {
 		0x00
 	};
 
-	static int next[5] = {
+	static const int next[5] = {
 		0,
 		1,
 		0,
@@ -113,17 +113,17 @@ static int checkString(const char * chars, size_t length, size_t *codepointCount
 			_release_lock(_stringLock);
 			krk_runtimeError(vm.exceptions->valueError, "Invalid UTF-8 sequence in string.");
 			*codepointCount = 0;
-			return KRK_STRING_INVALID;
+			return -1;
 		}
 	}
 	if (maxCodepoint > 0xFFFF) {
-		return KRK_STRING_UCS4;
+		return KRK_OBJ_FLAGS_STRING_UCS4;
 	} else if (maxCodepoint > 0xFF) {
-		return KRK_STRING_UCS2;
+		return KRK_OBJ_FLAGS_STRING_UCS2;
 	} else if (maxCodepoint > 0x7F) {
-		return KRK_STRING_UCS1;
+		return KRK_OBJ_FLAGS_STRING_UCS1;
 	} else {
-		return KRK_STRING_ASCII;
+		return KRK_OBJ_FLAGS_STRING_ASCII;
 	}
 }
 
@@ -149,20 +149,20 @@ GENREADY(4,uint32_t)
 
 void * krk_unicodeString(KrkString * string) {
 	if (string->codes) return string->codes;
-	if (string->type == KRK_STRING_UCS1) _readyUCS1(string);
-	else if (string->type == KRK_STRING_UCS2) _readyUCS2(string);
-	else if (string->type == KRK_STRING_UCS4) _readyUCS4(string);
+	else if ((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_UCS1) _readyUCS1(string);
+	else if ((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_UCS2) _readyUCS2(string);
+	else if ((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_UCS4) _readyUCS4(string);
 	else krk_runtimeError(vm.exceptions->valueError, "Internal string error.");
 	return string->codes;
 }
 
 uint32_t krk_unicodeCodepoint(KrkString * string, size_t index) {
 	krk_unicodeString(string);
-	switch (string->type) {
-		case KRK_STRING_ASCII: return string->chars[index];
-		case KRK_STRING_UCS1: return ((uint8_t*)string->codes)[index];
-		case KRK_STRING_UCS2: return ((uint16_t*)string->codes)[index];
-		case KRK_STRING_UCS4: return ((uint32_t*)string->codes)[index];
+	switch (string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) {
+		case KRK_OBJ_FLAGS_STRING_ASCII:
+		case KRK_OBJ_FLAGS_STRING_UCS1: return ((uint8_t*)string->codes)[index];
+		case KRK_OBJ_FLAGS_STRING_UCS2: return ((uint16_t*)string->codes)[index];
+		case KRK_OBJ_FLAGS_STRING_UCS4: return ((uint32_t*)string->codes)[index];
 		default:
 			krk_runtimeError(vm.exceptions->valueError, "Internal string error.");
 			return 0;
@@ -172,18 +172,17 @@ uint32_t krk_unicodeCodepoint(KrkString * string, size_t index) {
 static KrkString * allocateString(char * chars, size_t length, uint32_t hash) {
 	size_t codesLength = 0;
 	int type = checkString(chars,length,&codesLength);
-	if (type == KRK_STRING_INVALID) {
+	if (type == -1) {
 		return krk_copyString("",0);
 	}
 	KrkString * string = ALLOCATE_OBJECT(KrkString, KRK_OBJ_STRING);
 	string->length = length;
 	string->chars = chars;
 	string->obj.hash = hash;
-	string->obj.flags |= KRK_OBJ_FLAGS_VALID_HASH;
+	string->obj.flags |= KRK_OBJ_FLAGS_VALID_HASH | type;
 	string->codesLength = codesLength;
-	string->type = type;
 	string->codes = NULL;
-	if (string->type == KRK_STRING_ASCII) string->codes = string->chars;
+	if (type == KRK_OBJ_FLAGS_STRING_ASCII) string->codes = string->chars;
 	krk_push(OBJECT_VAL(string));
 	krk_tableSet(&vm.strings, OBJECT_VAL(string), NONE_VAL());
 	krk_pop();
@@ -246,11 +245,10 @@ KrkString * krk_takeStringVetted(char * chars, size_t length, size_t codesLength
 	string->length = length;
 	string->chars = chars;
 	string->obj.hash = hash;
-	string->obj.flags |= KRK_OBJ_FLAGS_VALID_HASH;
+	string->obj.flags |= KRK_OBJ_FLAGS_VALID_HASH | type;
 	string->codesLength = codesLength;
-	string->type = type;
 	string->codes = NULL;
-	if (string->type == KRK_STRING_ASCII) string->codes = string->chars;
+	if (type == KRK_OBJ_FLAGS_STRING_ASCII) string->codes = string->chars;
 	krk_push(OBJECT_VAL(string));
 	krk_tableSet(&vm.strings, OBJECT_VAL(string), NONE_VAL());
 	krk_pop();
@@ -265,10 +263,8 @@ KrkCodeObject * krk_newCodeObject(void) {
 	codeobject->upvalueCount = 0;
 	codeobject->name = NULL;
 	codeobject->docstring = NULL;
-	codeobject->flags = 0;
 	codeobject->localNameCount = 0;
 	codeobject->localNames = NULL;
-	codeobject->globalsContext = NULL;
 	krk_initValueArray(&codeobject->requiredArgNames);
 	krk_initValueArray(&codeobject->keywordArgNames);
 	krk_initChunk(&codeobject->chunk);
@@ -278,13 +274,13 @@ KrkCodeObject * krk_newCodeObject(void) {
 KrkNative * krk_newNative(NativeFn function, const char * name, int type) {
 	KrkNative * native = ALLOCATE_OBJECT(KrkNative, KRK_OBJ_NATIVE);
 	native->function = function;
-	native->flags = type;
+	native->obj.flags = type;
 	native->name = name;
 	native->doc = NULL;
 	return native;
 }
 
-KrkClosure * krk_newClosure(KrkCodeObject * function) {
+KrkClosure * krk_newClosure(KrkCodeObject * function, KrkValue globals) {
 	KrkUpvalue ** upvalues = ALLOCATE(KrkUpvalue*, function->upvalueCount);
 	for (size_t i = 0; i < function->upvalueCount; ++i) {
 		upvalues[i] = NULL;
@@ -294,6 +290,17 @@ KrkClosure * krk_newClosure(KrkCodeObject * function) {
 	closure->upvalues = upvalues;
 	closure->upvalueCount = function->upvalueCount;
 	closure->annotations = krk_dict_of(0,NULL,0);
+	closure->globalsOwner = globals;
+	if (IS_INSTANCE(globals)) {
+		if (AS_INSTANCE(globals)->_class == vm.baseClasses->dictClass) {
+			closure->globalsTable = AS_DICT(globals);
+		} else {
+			closure->globalsTable = &AS_INSTANCE(globals)->fields;
+		}
+	} else {
+		fprintf(stderr, "Invalid globals context: %s\n", krk_typeName(globals));
+		abort();
+	}
 	krk_initTable(&closure->fields);
 	return closure;
 }

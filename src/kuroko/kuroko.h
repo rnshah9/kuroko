@@ -10,15 +10,6 @@
 
 typedef int64_t krk_integer_type;
 
-#define ENABLE_THREADING
-#define PRIkrk_int "%" PRId64
-#define PRIkrk_hex "%" PRIx64
-#define parseStrInt strtoll
-
-#if defined(KRK_DISABLE_THREADS) || defined(__EMSCRIPTEN__) || defined(EFI_PLATFORM)
-# undef ENABLE_THREADING
-#endif
-
 #ifndef _WIN32
 # define PATH_SEP "/"
 # ifndef STATIC_ONLY

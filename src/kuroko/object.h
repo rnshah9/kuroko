@@ -9,7 +9,7 @@
 #include "chunk.h"
 #include "table.h"
 
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 #include <pthread.h>
 #endif
 
@@ -39,17 +39,34 @@ typedef enum {
  * the core structures for garbage collection.
  */
 typedef struct KrkObj {
-	KrkObjType type;      /**< @brief Tag indicating core type */
-	uint32_t flags;       /**< @brief General object flags, mostly related to garbage collection. */
+	uint16_t type;        /**< @brief Tag indicating core type */
+	uint16_t flags;       /**< @brief General object flags, mostly related to garbage collection. */
 	uint32_t hash;        /**< @brief Cached hash value for table keys */
 	struct KrkObj * next; /**< @brief Invasive linked list of all objects in the VM */
 } KrkObj;
 
-#define KRK_OBJ_FLAGS_SECOND_CHANCE 0x0001
-#define KRK_OBJ_FLAGS_IS_MARKED  0x0010
-#define KRK_OBJ_FLAGS_IN_REPR    0x0020
-#define KRK_OBJ_FLAGS_IMMORTAL   0x0040
-#define KRK_OBJ_FLAGS_VALID_HASH 0x0080
+#define KRK_OBJ_FLAGS_STRING_MASK   0x0003
+#define KRK_OBJ_FLAGS_STRING_ASCII  0x0000
+#define KRK_OBJ_FLAGS_STRING_UCS1   0x0001
+#define KRK_OBJ_FLAGS_STRING_UCS2   0x0002
+#define KRK_OBJ_FLAGS_STRING_UCS4   0x0003
+
+#define KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS 0x0001
+#define KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS  0x0002
+#define KRK_OBJ_FLAGS_CODEOBJECT_IS_GENERATOR  0x0004
+#define KRK_OBJ_FLAGS_CODEOBJECT_IS_COROUTINE  0x0008
+
+#define KRK_OBJ_FLAGS_FUNCTION_MASK                0x0003
+#define KRK_OBJ_FLAGS_FUNCTION_IS_CLASS_METHOD     0x0001
+#define KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD    0x0002
+
+#define KRK_OBJ_FLAGS_NO_INHERIT    0x0200
+#define KRK_OBJ_FLAGS_SECOND_CHANCE 0x0100
+#define KRK_OBJ_FLAGS_IS_MARKED     0x0010
+#define KRK_OBJ_FLAGS_IN_REPR       0x0020
+#define KRK_OBJ_FLAGS_IMMORTAL      0x0040
+#define KRK_OBJ_FLAGS_VALID_HASH    0x0080
+
 
 /**
  * @brief String compact storage type.
@@ -62,21 +79,19 @@ typedef struct KrkObj {
  * but this is not possible for UCS1.
  */
 typedef enum {
-	KRK_STRING_ASCII = 0,   /**< Codepoints can be extracted directly from UTF8 data. */
-	KRK_STRING_UCS1  = 1,   /**< Codepoints are one byte. */
-	KRK_STRING_UCS2  = 2,   /**< Codepoints are two bytes. */
-	KRK_STRING_UCS4  = 4,   /**< Codepoints are four bytes. */
-	KRK_STRING_INVALID = 5, /**< This is an invalid string. */
+	/* For compatibility */
+	KRK_STRING_ASCII   = KRK_OBJ_FLAGS_STRING_ASCII,  /**< Codepoints can be extracted directly from UTF8 data. */
+	KRK_STRING_UCS1    = KRK_OBJ_FLAGS_STRING_UCS1,   /**< Codepoints are one byte. */
+	KRK_STRING_UCS2    = KRK_OBJ_FLAGS_STRING_UCS2,   /**< Codepoints are two bytes. */
+	KRK_STRING_UCS4    = KRK_OBJ_FLAGS_STRING_UCS4,   /**< Codepoints are four bytes. */
 } KrkStringType;
 
-#undef KrkString
 /**
  * @brief Immutable sequence of Unicode codepoints.
  * @extends KrkObj
  */
 typedef struct KrkString {
 	KrkObj obj;          /**< @protected @brief Base */
-	KrkStringType type;  /**< @brief String codepoint storage format */
 	size_t length;       /**< @brief String length in bytes */
 	size_t codesLength;  /**< @brief String length in Unicode codepoints */
 	char * chars;        /**< @brief UTF8 canonical data */
@@ -128,8 +143,10 @@ struct KrkInstance;
  */
 typedef struct {
 	KrkObj obj;                            /**< @protected @brief Base */
-	short requiredArgs;                    /**< @brief Arity of required (non-default) arguments */
-	short keywordArgs;                     /**< @brief Arity of keyword (default) arguments */
+	unsigned short requiredArgs;           /**< @brief Arity of required (non-default) arguments */
+	unsigned short keywordArgs;            /**< @brief Arity of keyword (default) arguments */
+	unsigned short potentialPositionals;
+	unsigned short totalArguments;
 	size_t upvalueCount;                   /**< @brief Number of upvalues this function collects as a closure */
 	KrkChunk chunk;                        /**< @brief Bytecode data */
 	KrkString * name;                      /**< @brief Name of the function */
@@ -139,15 +156,9 @@ typedef struct {
 	size_t localNameCapacity;              /**< @brief Capacity of @ref localNames */
 	size_t localNameCount;                 /**< @brief Number of entries in @ref localNames */
 	KrkLocalEntry * localNames;            /**< @brief Stores the names of local variables used in the function, for debugging */
-	unsigned int flags;                    /**< @brief Function type flags */
-	struct KrkInstance * globalsContext;   /**< @brief The globals namespace the function should reference when called */
 	KrkString * qualname;                  /**< @brief The dotted name of the function */
 } KrkCodeObject;
 
-#define KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS 0x0001
-#define KRK_CODEOBJECT_FLAGS_COLLECTS_KWS  0x0002
-#define KRK_CODEOBJECT_FLAGS_IS_GENERATOR  0x0004
-#define KRK_CODEOBJECT_FLAGS_IS_COROUTINE  0x0008
 
 /**
  * @brief Function object.
@@ -160,13 +171,11 @@ typedef struct {
 	KrkCodeObject * function;  /**< @brief The codeobject containing the bytecode run when this function is called */
 	KrkUpvalue ** upvalues;    /**< @brief Array of upvalues collected from the surrounding context when the closure was created */
 	size_t upvalueCount;       /**< @brief Number of entries in @ref upvalues */
-	unsigned int flags;        /**< @brief Closure type flags */
 	KrkValue annotations;      /**< @brief Dictionary of type hints */
 	KrkTable fields;           /**< @brief Object attributes table */
+	KrkValue globalsOwner;     /**< @brief Owner of the globals table for this function */
+	KrkTable * globalsTable;   /**< @brief Pointer to globals table with owner object */
 } KrkClosure;
-
-#define KRK_FUNCTION_FLAGS_IS_CLASS_METHOD  0x0001
-#define KRK_FUNCTION_FLAGS_IS_STATIC_METHOD 0x0002
 
 typedef void (*KrkCleanupCallback)(struct KrkInstance *);
 
@@ -187,6 +196,7 @@ typedef struct KrkClass {
 	size_t allocSize;         /**< @brief Size to allocate when creating instances of this class */
 	KrkCleanupCallback _ongcscan;   /**< @brief C function to call when the garbage collector visits an instance of this class in the scan phase */
 	KrkCleanupCallback _ongcsweep;  /**< @brief C function to call when the garbage collector is discarding an instance of this class */
+	KrkTable subclasses;      /**< @brief Set of classes that subclass this class */
 
 	KrkObj * _getter;         /**< @brief @c %__getitem__  Called when an instance is subscripted */
 	KrkObj * _setter;         /**< @brief @c %__setitem__  Called when a subscripted instance is assigned to */
@@ -208,7 +218,28 @@ typedef struct KrkClass {
 	KrkObj * _classgetitem;   /**< @brief @c %__class_getitem__ Class method called when a type object is subscripted; used for type hints */
 	KrkObj * _hash;           /**< @brief @c %__hash__     Called when an instance is a key in a dict or an entry in a set */
 
-	KrkTable subclasses;
+	KrkObj * _add, * _radd, * _iadd;
+	KrkObj * _sub, * _rsub, * _isub;
+	KrkObj * _mul, * _rmul, * _imul;
+	KrkObj * _or,  * _ror,  * _ior;
+	KrkObj * _xor, * _rxor, * _ixor;
+	KrkObj * _and, * _rand, * _iand;
+	KrkObj * _mod, * _rmod, * _imod;
+	KrkObj * _pow, * _rpow, * _ipow;
+	KrkObj * _lshift, * _rlshift, * _ilshift;
+	KrkObj * _rshift, * _rrshift, * _irshift;
+	KrkObj * _truediv, * _rtruediv, * _itruediv;
+	KrkObj * _floordiv, * _rfloordiv, * _ifloordiv;
+
+	KrkObj * _lt, * _gt, * _le, * _ge;
+	KrkObj * _invert, * _negate;
+	KrkObj * _set_name;
+	KrkObj * _matmul, * _rmatmul, * _imatmul;
+	KrkObj * _pos;
+	KrkObj * _setattr;
+	KrkObj * _format;
+
+	size_t cacheIndex;
 } KrkClass;
 
 /**
@@ -239,7 +270,7 @@ typedef struct {
 	KrkObj * method;    /**< @brief Function to call */
 } KrkBoundMethod;
 
-typedef KrkValue (*NativeFn)(int argCount, KrkValue* args, int hasKwargs);
+typedef KrkValue (*NativeFn)(int argCount, const KrkValue* args, int hasKwargs);
 
 /**
  * @brief Managed binding to a C function.
@@ -252,12 +283,7 @@ typedef struct {
 	NativeFn function;    /**< @brief C function pointer */
 	const char * name;    /**< @brief Name to use when repring */
 	const char * doc;     /**< @brief Docstring to supply from @c %__doc__ */
-	unsigned int flags;   /**< @brief Binding flags */
 } KrkNative;
-
-#define KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY 0x0001
-#define KRK_NATIVE_FLAGS_IS_STATIC_METHOD    0x0002
-#define KRK_NATIVE_FLAGS_IS_CLASS_METHOD     0x0004
 
 /**
  * @brief Immutable sequence of arbitrary values.
@@ -281,7 +307,7 @@ typedef struct {
 typedef struct {
 	KrkInstance inst;     /**< @protected @brief Base */
 	KrkValueArray values; /**< @brief Stores the length, capacity, and actual values of the list */
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 	pthread_rwlock_t rwlock;
 #endif
 } KrkList;
@@ -469,7 +495,7 @@ extern int krk_getAwaitable(void);
  * Returns a generic alias object. Bind this to a class's \__class_getitem__
  * to allow for generic collection types to be used in type hints.
  */
-extern NativeFn KrkGenericAlias;
+extern NativeFn krk_GenericAlias;
 
 /**
  * @brief Create a new, uninitialized code object.
@@ -502,7 +528,7 @@ extern KrkNative *      krk_newNative(NativeFn function, const char * name, int 
  *
  * @param function Code object to assign to the new function object.
  */
-extern KrkClosure *     krk_newClosure(KrkCodeObject * function);
+extern KrkClosure *     krk_newClosure(KrkCodeObject * function, KrkValue globals);
 
 /**
  * @brief Create an upvalue slot.

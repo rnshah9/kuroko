@@ -49,55 +49,11 @@ typedef struct {
 	size_t slots;         /**< Offset into the stack at which this function call's arguments begin */
 	size_t outSlots;      /**< Offset into the stack at which stackTop will be reset upon return */
 	KrkTable * globals;   /**< Pointer to the attribute table containing valud global vairables for this call */
+	KrkValue   globalsOwner; /**< Owner of the current globals context, to give to new closures. */
+#ifndef KRK_NO_CALLGRIND
 	struct timespec in_time;
+#endif
 } KrkCallFrame;
-
-/**
- * @brief Index numbers for always-available interned strings representing important method and member names.
- *
- * The VM must look up many methods and members by fixed names. To avoid
- * continuously having to box and unbox these from C strings to the appropriate
- * interned @c KrkString, we keep an array of the @c KrkString pointers in the global VM state.
- *
- * These values are the offsets into that index for each of the relevant
- * function names (generally with extra underscores removed). For example
- * @c METHOD_INIT is the offset for the string value for @c "__init__".
- */
-typedef enum {
-	METHOD_INIT,
-	METHOD_STR,
-	METHOD_REPR,
-	METHOD_GET,
-	METHOD_SET,
-	METHOD_CLASS,
-	METHOD_NAME,
-	METHOD_FILE,
-	METHOD_INT,
-	METHOD_FLOAT,
-	METHOD_CHR,
-	METHOD_LEN,
-	METHOD_DOC,
-	METHOD_BASE,
-	METHOD_GETSLICE,
-	METHOD_ORD,
-	METHOD_CALL,
-	METHOD_EQ,
-	METHOD_ENTER,
-	METHOD_EXIT,
-	METHOD_DELITEM,
-	METHOD_ITER,
-	METHOD_GETATTR,
-	METHOD_DIR,
-	METHOD_SETSLICE,
-	METHOD_DELSLICE,
-	METHOD_CONTAINS,
-	METHOD_DESCGET,
-	METHOD_DESCSET,
-	METHOD_CLASSGETITEM,
-	METHOD_HASH,
-
-	METHOD__MAX,
-} KrkSpecialMethods;
 
 /**
  * @brief Table of basic exception types.
@@ -125,6 +81,8 @@ struct Exceptions {
 	KrkClass * notImplementedError; /**< @exception NotImplementedError The method is not implemented, either for the given arguments or in general. */
 	KrkClass * syntaxError;         /**< @exception SyntaxError The compiler encountered an unrecognized or invalid source code input. */
 	KrkClass * assertionError;      /**< @exception AssertionError An @c assert statement failed. */
+	KrkClass * OSError;             /**< @exception os.OSError Raised by os module functions. */
+	KrkClass * ThreadError;         /**< @exception threading.ThreadError Raised by threading module functions. */
 };
 
 /**
@@ -169,6 +127,23 @@ struct BaseClasses {
 	KrkClass * bytearrayClass;       /**< Mutable array of bytes */
 	KrkClass * dictvaluesClass;      /**< Iterator over values of a dict */
 	KrkClass * sliceClass;           /**< Slice object */
+	KrkClass * longClass;            /**< Arbitrary precision integer */
+	KrkClass * mapClass;             /**< Apply a function to entries from an iterator. */
+	KrkClass * zipClass;             /**< Yield elements from multiple iterators. */
+	KrkClass * filterClass;          /**< Yield elements from an iterator for which a function returns a truthy value. */
+	KrkClass * enumerateClass;       /**< Yield pairs of indexes and values from an iterator. */
+	KrkClass * HelperClass;          /**< Class implementation of 'help' object */
+	KrkClass * LicenseReaderClass;   /**< Class implementation of 'license' object */
+	KrkClass * FileClass;            /**< os.File */
+	KrkClass * BinaryFileClass;      /**< os.BinaryFile */
+	KrkClass * DirectoryClass;       /**< os.Directory */
+	KrkClass * stat_resultClass;     /**< stat.stat_result */
+	KrkClass * EnvironClass;         /**< os._Environ */
+	KrkClass * setClass;             /**< Unordered hashset */
+	KrkClass * setiteratorClass;     /**< Iterator over values in a set */
+	KrkClass * ThreadClass;          /**< Threading.Thread */
+	KrkClass * LockClass;            /**< Threading.Lock */
+	KrkClass * CompilerStateClass;   /**< Compiler global state */
 };
 
 /**
@@ -229,6 +204,7 @@ typedef struct KrkVM {
 	KrkThreadState * threads;         /**< Invasive linked list of all VM threads. */
 	FILE * callgrindFile;             /**< File to write unprocessed callgrind data to. */
 	size_t maximumCallDepth;          /**< Maximum recursive call depth. */
+	struct DebuggerState * dbgState;  /**< Opaque debugger state pointer. */
 } KrkVM;
 
 /* Thread-specific flags */
@@ -247,8 +223,9 @@ typedef struct KrkVM {
 #define KRK_GLOBAL_CALLGRIND           (1 << 11)
 #define KRK_GLOBAL_REPORT_GC_COLLECTS  (1 << 12)
 #define KRK_GLOBAL_THREADS             (1 << 13)
+#define KRK_GLOBAL_NO_DEFAULT_MODULES  (1 << 14)
 
-#ifdef ENABLE_THREADING
+#ifndef KRK_DISABLE_THREADS
 #  define threadLocal __thread
 #else
 #  define threadLocal
@@ -259,16 +236,17 @@ typedef struct KrkVM {
  *
  * See @c KrkThreadState for more information.
  */
-#if defined(ENABLE_THREADING) && ((defined(__APPLE__)) && defined(__aarch64__))
+#if !defined(KRK_DISABLE_THREADS) && ((defined(__APPLE__)) && defined(__aarch64__))
 extern void krk_forceThreadData(void);
 #define krk_currentThread (*_macos_currentThread())
 #pragma clang diagnostic ignored "-Wlanguage-extension-token"
+__attribute__((always_inline))
 inline KrkThreadState * _macos_currentThread(void) {
 	extern const uint64_t tls_desc[] asm("_krk_currentThread");
 	const uintptr_t * threadptr; asm ("mrs %0, TPIDRRO_EL0" : "=r"(threadptr));
 	return (KrkThreadState*)(threadptr[tls_desc[1]] + tls_desc[2]);
 }
-#elif defined(ENABLE_THREADING) && ((defined(_WIN32) && !defined(KRKINLIB)) || defined(KRK_MEDIOCRE_TLS))
+#elif !defined(KRK_DISABLE_THREADS) && ((defined(_WIN32) && !defined(KRKINLIB)) || defined(KRK_MEDIOCRE_TLS))
 #define krk_currentThread (*krk_getCurrentThread())
 #else
 extern threadLocal KrkThreadState krk_currentThread;
@@ -355,19 +333,6 @@ extern KrkValue krk_interpret(const char * src, char * fromFile);
  *         or the final return value of the VM execution.
  */
 extern KrkValue krk_runfile(const char * fileName, char * fromFile);
-
-/**
- * @brief Load and run a file as a module.
- *
- * Similar to @c krk_runfile but ensures that execution of the VM returns to the caller
- * after the file is run. This should be run after calling @c krk_startModule to initialize
- * a new module context and is used internally by the import mechanism.
- *
- * @param fileName Path to the source file to read and execute.
- * @param fromFile Value to assign to @c \__file__
- * @return The object representing the module, or None if execution of the file failed.
- */
-extern KrkValue krk_callfile(const char * fileName, char * fromFile);
 
 /**
  * @brief Push a stack value.
@@ -464,6 +429,16 @@ extern KrkNative * krk_defineNativeProperty(KrkTable * table, const char * name,
  * a value to an attribute table. Rather than using @c krk_tableSet, this is
  * the preferred method of supplying fields to objects from C code.
  *
+ * Note that since this inserts values directly into tables, it skips any
+ * mechanisms like \__setattr__ or descriptor \__set__. If you need to support
+ * these mechanisms, use @c krk_setAttribute. If you have an instance and would
+ * like to emulate the behavior of object.__setattr__, you may also wish to
+ * use @c krk_instanceSetAttribute_wrapper.
+ *
+ * @warning As this function takes a C string, it does not support setting attributes
+ * @warning with names containing nil bytes. Use one of the other mechanisms if you
+ * @warning do not have full control over the attribute names you are trying to set.
+ *
  * @param table Attribute table to attach to, such as @c &someInstance->fields
  * @param name  Nil-terminated C string with the name to assign
  * @param obj   Value to attach.
@@ -480,6 +455,16 @@ extern void krk_attachNamedValue(KrkTable * table, const char name[], KrkValue o
  *
  * This is a convenience wrapper around @c krk_attachNamedValue.
  *
+ * Note that since this inserts values directly into tables, it skips any
+ * mechanisms like \__setattr__ or descriptor \__set__. If you need to support
+ * these mechanisms, use @c krk_setAttribute. If you have an instance and would
+ * like to emulate the behavior of object.__setattr__, you may also wish to
+ * use @c krk_instanceSetAttribute_wrapper.
+ *
+ * @warning As this function takes a C string, it does not support setting attributes
+ * @warning with names containing nil bytes. Use one of the other mechanisms if you
+ * @warning do not have full control over the attribute names you are trying to set.
+ *
  * @param table Attribute table to attach to, such as @c &someInstance->fields
  * @param name  Nil-terminated C string with the name to assign
  * @param obj   Object to attach.
@@ -487,7 +472,7 @@ extern void krk_attachNamedValue(KrkTable * table, const char name[], KrkValue o
 extern void krk_attachNamedObject(KrkTable * table, const char name[], KrkObj * obj);
 
 /**
- * @brief Raise an exception.
+ * @brief Produce and raise an exception with a formatted message.
  *
  * Creates an instance of the given exception type, passing a formatted
  * string to the initializer. All of the core exception types take an option
@@ -497,12 +482,54 @@ extern void krk_attachNamedObject(KrkTable * table, const char name[], KrkObj * 
  * The created exception object is attached to the current thread state and
  * the @c KRK_THREAD_HAS_EXCEPTION flag is set.
  *
+ * If the format string is exactly "%V", the first format argument will
+ * be attached the exception as the 'msg' attribute.
+ *
+ * No field width or precisions are supported on any conversion specifiers.
+ *
+ * Standard conversion specifiers 'c', 's', 'd', 'u' are available, and the
+ * 'd' and 'u' specifiers may have length modifiers of l, L, or z.
+ *
+ * Additional format specifiers are as follows:
+ *
+ * @c %S - Accepts one KrkString* to be printed in its entirety.
+ * @c %R - Accepts one KrkValue and calls repr on it.
+ * @c %T - Accepts one KrkValue and emits the name of its type.
+ *
  * @param type Class pointer for the exception type, eg. @c vm.exceptions->valueError
  * @param fmt  Format string.
  * @return As a convenience to C extension authors, returns @c None
  */
-extern KrkValue krk_runtimeError(KrkClass * type, const char * fmt, ...)
-	__attribute__((format (printf, 2, 3)));
+extern KrkValue krk_runtimeError(KrkClass * type, const char * fmt, ...);
+
+/**
+ * @brief Raise an exception value.
+ *
+ * Implementation of the @c OP_RAISE and @c OP_RAISE_FROM instructions.
+ *
+ * If either of @p base or @p cause is a class, the class will be called to
+ * produce an instance, so exception classes may be used directly if desired.
+ *
+ * If @p cause is not @c None it will be attached as @c \__cause__ to the
+ * resulting exception object.
+ *
+ * A traceback is automatically attached.
+ *
+ * @param base Exception object or class to raise.
+ * @param cause Exception cause object or class to attach.
+ */
+extern void krk_raiseException(KrkValue base, KrkValue cause);
+
+/**
+ * @brief Attach an inner exception to the current exception object.
+ *
+ * Sets the @c \__context__ of the current exception object.
+ *
+ * There must be a current exception, and it must be an instance object.
+ *
+ * @param innerException \__context__ to set.
+ */
+extern void krk_attachInnerException(KrkValue innerException);
 
 /**
  * @brief Get a pointer to the current thread state.
@@ -601,40 +628,32 @@ extern int krk_callValue(KrkValue callee, int argCount, int callableOnStack);
 /**
  * @brief Create a list object.
  * @memberof KrkList
- *
- * This is the native function bound to @c listOf
  */
-extern KrkValue krk_list_of(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_list_of(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Create a dict object.
  * @memberof KrkDict
- *
- * This is the native function bound to @c dictOf
  */
-extern KrkValue krk_dict_of(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_dict_of(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Create a tuple object.
  * @memberof KrkTuple
- *
- * This is the native function bound to @c tupleOf
  */
-extern KrkValue krk_tuple_of(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_tuple_of(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Create a set object.
  * @memberof Set
- *
- * This is the native function bound to @c setOf
  */
-extern KrkValue krk_set_of(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_set_of(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Create a slice object.
  * @memberof KrkSlice
  */
-extern KrkValue krk_slice_of(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_slice_of(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Call a callable on the stack with @p argCount arguments.
@@ -720,7 +739,7 @@ extern KrkInstance * krk_startModule(const char * name);
  *
  * This is the native function bound to @c object.__dir__
  */
-extern KrkValue krk_dirObject(int argc, KrkValue argv[], int hasKw);
+extern KrkValue krk_dirObject(int argc, const KrkValue argv[], int hasKw);
 
 /**
  * @brief Load a module from a file with a specified name.
@@ -782,6 +801,9 @@ extern int krk_isFalsey(KrkValue value);
  * This is a convenience function that works in essentially the
  * same way as the OP_GET_PROPERTY instruction.
  *
+ * @warning As this function takes a C string, it will not work with
+ * @warning attribute names that have nil bytes.
+ *
  * @param value Value to examine.
  * @param name  C-string of the property name to query.
  * @return The requested property, or None with an @ref AttributeError
@@ -802,6 +824,9 @@ extern KrkValue krk_valueGetAttribute_default(KrkValue value, char * name, KrkVa
  * This is a convenience function that works in essentially the
  * same way as the OP_SET_PROPERTY instruction.
  *
+ * @warning As this function takes a C string, it will not work with
+ * @warning attribute names that have nil bytes.
+ *
  * @param owner The owner of the property to modify.
  * @param name  C-string of the property name to modify.
  * @param to    The value to assign.
@@ -817,6 +842,9 @@ extern KrkValue krk_valueSetAttribute(KrkValue owner, char * name, KrkValue to);
  *
  * This is a convenience function that works in essentially the
  * same way as the OP_DEL_PROPERTY instruction.
+ *
+ * @warning As this function takes a C string, it will not work with
+ * @warning attribute names that have nil bytes.
  *
  * @param owner The owner of the property to delete.
  * @param name  C-string of the property name to delete.
@@ -846,7 +874,23 @@ extern KrkValue krk_operator_lt(KrkValue,KrkValue);
 extern KrkValue krk_operator_gt(KrkValue,KrkValue);
 
 /**
+ * @brief Compare two values, returning @ref True if the left is less than or equal to the right.
+ *
+ * This is equivalent to the opcode instruction OP_LESS_EQUAL.
+ */
+extern KrkValue krk_operator_le(KrkValue,KrkValue);
+
+/**
+ * @brief Compare to values, returning @ref True if the left is greater than or equal to the right.
+ *
+ * This is equivalent to the opcode instruction OP_GREATER_EQUAL.
+ */
+extern KrkValue krk_operator_ge(KrkValue,KrkValue);
+
+/**
  * @brief Set the maximum recursion call depth.
+ *
+ * Must not be called while execution is in progress.
  */
 extern void krk_setMaximumRecursionDepth(size_t maxDepth);
 
@@ -860,4 +904,108 @@ extern void krk_setMaximumRecursionDepth(size_t maxDepth);
  * held stack is reallocated, it will be freed when execution returns to the call
  * to @c krk_callNativeOnStack that holds it.
  */
-KrkValue krk_callNativeOnStack(NativeFn native, size_t argCount, KrkValue *stackArgs, int hasKw);
+extern KrkValue krk_callNativeOnStack(size_t argCount, const KrkValue *stackArgs, int hasKw, NativeFn native);
+
+/**
+ * @brief Set an attribute of an instance object, bypassing \__setattr__.
+ *
+ * This can be used to emulate the behavior of super(object).__setattr__ for
+ * types that derive from KrkInstance and have a fields table, and is the internal
+ * mechanism by which object.__setattr__() performs this task.
+ *
+ * Does not bypass descriptors.
+ *
+ * @param owner Instance object to set an attribute on.
+ * @param name  Name of the attribute
+ * @param to    New value for the attribute
+ * @return The value set, which is likely @p to but may be the returned value of a descriptor \__set__ method.
+ */
+extern KrkValue krk_instanceSetAttribute_wrapper(KrkValue owner, KrkString * name, KrkValue to);
+
+/**
+ * @brief Implementation of the GET_PROPERTY instruction.
+ *
+ * Retrieves the attribute specifed by @p name from the value at the top of the
+ * stack. The top of the stack will be replaced with the resulting attribute value,
+ * if one is found, and 1 will be returned. Otherwise, 0 is returned and the stack
+ * remains unchanged. No exception is raised if the property is not found, allowing
+ * this function to be used in context where a default value is desired, but note
+ * that exceptions may be raised \__getattr__ methods or by descriptor \__get__ methods.
+ *
+ * @param name Name of the attribute to look up.
+ * @return 1 if the attribute was found, 0 otherwise.
+ */
+extern int krk_getAttribute(KrkString * name);
+
+/**
+ * @brief Implementation of the SET_PROPERTY instruction.
+ *
+ * Sets the attribute specifed by @p name on the value second from top of the stack
+ * to the value at the top of the stack. Upon successful completion, 1 is returned
+ * the stack is reduced by one slot, and the top of the stack is the value set, which
+ * may be the result of a descriptor \__set__ method. If the owner object does not
+ * allow for attributes to be set, and no descriptor object is present, 0 will be
+ * returned and the stack remains unmodified. No exception is raised in this case,
+ * though exceptions may still be raised by \__setattr__ methods or descriptor
+ * \__set__ methods.
+ *
+ * @param name Name of the attribute to set.
+ * @return 1 if the attribute could be set, 0 otherwise.
+ */
+extern int krk_setAttribute(KrkString * name);
+
+/**
+ * @brief Implementation of the DEL_PROPERTY instruction.
+ *
+ * Attempts to delete the attribute specified by @p name from the value at the
+ * top of the stack, returning 1 and reducing the stack by one on success. If
+ * the attribute is not found or attribute deletion is not meaningful, 0 is
+ * returned and the stack remains unmodified, but no exception is raised.
+ *
+ * @warning Currently, no \__delattr__ mechanism is available.
+ *
+ * @param name Name of the attribute to delete.
+ * @return 1 if the attribute was found and can be deleted, 0 otherwise.
+ */
+extern int krk_delAttribute(KrkString * name);
+
+/**
+ * @brief Initialize the built-in 'kuroko' module.
+ */
+extern void krk_module_init_kuroko(void);
+
+/**
+ * @brief Initialize the built-in 'gc' module.
+ */
+extern void krk_module_init_gc(void);
+
+/**
+ * @brief Initialize the built-in 'time' module.
+ */
+extern void krk_module_init_time(void);
+
+/**
+ * @brief Initialize the built-in 'os' module.
+ */
+extern void krk_module_init_os(void);
+
+/**
+ * @brief Initialize the built-in 'fileio' module.
+ */
+extern void krk_module_init_fileio(void);
+
+/**
+ * @brief Initialize the built-in 'dis' module.
+ *
+ * Not available if KRK_DISABLE_DEBUG is set.
+ */
+extern void krk_module_init_dis(void);
+
+/**
+ * @brief Initialize the built-in 'threading' module.
+ *
+ * Not available if KRK_DISABLE_THREADS is set.
+ */
+extern void krk_module_init_threading(void);
+
+

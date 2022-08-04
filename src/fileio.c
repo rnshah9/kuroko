@@ -14,9 +14,6 @@
 #include <kuroko/memory.h>
 #include <kuroko/util.h>
 
-static KrkClass * File = NULL;
-static KrkClass * BinaryFile = NULL;
-
 /**
  * @brief Object for a C `FILE*` stream.
  * @extends KrkInstance
@@ -27,13 +24,12 @@ struct File {
 	int unowned;
 };
 
-#define IS_File(o) (krk_isInstanceOf(o, File))
+#define IS_File(o) (krk_isInstanceOf(o, KRK_BASE_CLASS(File)))
 #define AS_File(o) ((struct File*)AS_OBJECT(o))
 
-#define IS_BinaryFile(o) (krk_isInstanceOf(o, BinaryFile))
+#define IS_BinaryFile(o) (krk_isInstanceOf(o, KRK_BASE_CLASS(BinaryFile)))
 #define AS_BinaryFile(o) ((struct File*)AS_OBJECT(o))
 
-static KrkClass * Directory = NULL;
 /**
  * @brief OBject for a C `DIR*` stream.
  * @extends KrkInstance
@@ -43,13 +39,13 @@ struct Directory {
 	DIR * dirPtr;
 };
 
-#define IS_Directory(o) (krk_isInstanceOf(o,Directory))
+#define IS_Directory(o) (krk_isInstanceOf(o, KRK_BASE_CLASS(Directory)))
 #define AS_Directory(o) ((struct Directory*)AS_OBJECT(o))
 
 #define CURRENT_CTYPE struct File *
 #define CURRENT_NAME  self
 
-KRK_FUNC(open,{
+KRK_Function(open) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	FUNCTION_TAKES_AT_MOST(2);
 	CHECK_ARG(0,str,KrkString*,filename);
@@ -81,7 +77,7 @@ KRK_FUNC(open,{
 	if (!file) return krk_runtimeError(vm.exceptions->ioError, "open: failed to open file; system returned: %s", strerror(errno));
 
 	/* Now let's build an object to hold it */
-	KrkInstance * fileObject = krk_newInstance(isBinary ? BinaryFile : File);
+	KrkInstance * fileObject = krk_newInstance(isBinary ? KRK_BASE_CLASS(BinaryFile) : KRK_BASE_CLASS(File));
 	krk_push(OBJECT_VAL(fileObject));
 
 	/* Let's put the filename in there somewhere... */
@@ -93,11 +89,11 @@ KRK_FUNC(open,{
 	krk_pop();
 	krk_pop();
 	return OBJECT_VAL(fileObject);
-})
+}
 
 #define BLOCK_SIZE 1024
 
-KRK_METHOD(File,__str__,{
+KRK_Method(File,__str__) {
 	METHOD_TAKES_NONE();
 	KrkValue filename;
 	KrkValue modestr;
@@ -109,9 +105,9 @@ KRK_METHOD(File,__str__,{
 	KrkString * out = krk_copyString(tmp, len);
 	free(tmp);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(File,readline,{
+KRK_Method(File,readline) {
 	METHOD_TAKES_NONE();
 	FILE * file = self->filePtr;
 
@@ -152,9 +148,9 @@ _finish_line: (void)0;
 	KrkString * out = krk_copyString(buffer,sizeRead);
 	free(buffer);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(File,readlines,{
+KRK_Method(File,readlines) {
 	METHOD_TAKES_NONE();
 	KrkValue myList = krk_list_of(0,NULL,0);
 	krk_push(myList);
@@ -171,9 +167,9 @@ KRK_METHOD(File,readlines,{
 
 	krk_pop(); /* myList */
 	return myList;
-})
+}
 
-KRK_METHOD(File,read,{
+KRK_Method(File,read) {
 	METHOD_TAKES_AT_MOST(1);
 
 	krk_integer_type sizeToRead = -1;
@@ -225,9 +221,9 @@ KRK_METHOD(File,read,{
 	KrkString * out = krk_copyString(buffer,sizeRead);
 	free(buffer);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(File,write,{
+KRK_Method(File,write) {
 	METHOD_TAKES_EXACTLY(1);
 	if (!IS_STRING(argv[1])) return TYPE_ERROR(str,argv[1]);
 	/* Find the file ptr reference */
@@ -238,47 +234,55 @@ KRK_METHOD(File,write,{
 	}
 
 	return INTEGER_VAL(fwrite(AS_CSTRING(argv[1]), 1, AS_STRING(argv[1])->length, file));
-})
+}
 
-KRK_METHOD(File,close,{
+KRK_Method(File,close) {
 	METHOD_TAKES_NONE();
 	FILE * file = self->filePtr;
 	if (file) fclose(file);
 	self->filePtr = NULL;
-})
+	return NONE_VAL();
+}
 
-KRK_METHOD(File,flush,{
+KRK_Method(File,flush) {
 	METHOD_TAKES_NONE();
 	FILE * file = self->filePtr;
 	if (file) fflush(file);
-})
+	return NONE_VAL();
+}
 
-KRK_METHOD(File,__init__,{
+KRK_Method(File,__init__) {
 	return krk_runtimeError(vm.exceptions->typeError, "File objects can not be instantiated; use fileio.open() to obtain File objects.");
-})
+}
 
-KRK_METHOD(File,__enter__,{})
-KRK_METHOD(File,__exit__,{
+KRK_Method(File,__enter__) {
+	return NONE_VAL();
+}
+KRK_Method(File,__exit__) {
 	return FUNC_NAME(File,close)(1,argv,0);
-})
+}
 
-static void makeFileInstance(KrkInstance * module, const char name[], FILE * file) {
-	KrkInstance * fileObject = krk_newInstance(File);
+static void makeFileInstance(KrkInstance * module, const char name[], FILE * file, const char mode[]) {
+	KrkInstance * fileObject = krk_newInstance(KRK_BASE_CLASS(File));
 	krk_push(OBJECT_VAL(fileObject));
 	KrkValue filename = OBJECT_VAL(krk_copyString(name,strlen(name)));
 	krk_push(filename);
+	KrkValue modestr = OBJECT_VAL(krk_copyString(mode,strlen(mode)));
+	krk_push(modestr);
 
 	krk_attachNamedValue(&fileObject->fields, "filename", filename);
+	krk_attachNamedValue(&fileObject->fields, "modestr", modestr);
 	((struct File*)fileObject)->filePtr = file;
 	((struct File*)fileObject)->unowned = 1;
 
 	krk_attachNamedObject(&module->fields, name, (KrkObj*)fileObject);
 
+	krk_pop(); /* modestr */
 	krk_pop(); /* filename */
 	krk_pop(); /* fileObject */
 }
 
-KRK_METHOD(BinaryFile,readline,{
+KRK_Method(BinaryFile,readline) {
 	METHOD_TAKES_NONE();
 	FILE * file = self->filePtr;
 
@@ -319,9 +323,9 @@ _finish_line: (void)0;
 	KrkBytes * out = krk_newBytes(sizeRead, (unsigned char*)buffer);
 	free(buffer);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(BinaryFile,readlines,{
+KRK_Method(BinaryFile,readlines) {
 	METHOD_TAKES_NONE();
 	KrkValue myList = krk_list_of(0,NULL,0);
 	krk_push(myList);
@@ -338,9 +342,9 @@ KRK_METHOD(BinaryFile,readlines,{
 
 	krk_pop(); /* myList */
 	return myList;
-})
+}
 
-KRK_METHOD(BinaryFile,read,{
+KRK_Method(BinaryFile,read) {
 	METHOD_TAKES_AT_MOST(1);
 
 	krk_integer_type sizeToRead = -1;
@@ -393,9 +397,9 @@ KRK_METHOD(BinaryFile,read,{
 	KrkBytes * out = krk_newBytes(sizeRead, (unsigned char*)buffer);
 	free(buffer);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(BinaryFile,write,{
+KRK_Method(BinaryFile,write) {
 	METHOD_TAKES_EXACTLY(1);
 	if (!IS_BYTES(argv[1])) return TYPE_ERROR(bytes,argv[1]);
 	/* Find the file ptr reference */
@@ -406,7 +410,7 @@ KRK_METHOD(BinaryFile,write,{
 	}
 
 	return INTEGER_VAL(fwrite(AS_BYTES(argv[1])->bytes, 1, AS_BYTES(argv[1])->length, file));
-})
+}
 
 #undef CURRENT_CTYPE
 
@@ -426,25 +430,25 @@ static void _dir_sweep(KrkInstance * self) {
 	}
 }
 
-KRK_FUNC(opendir,{
+KRK_Function(opendir) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,str,KrkString*,path);
 
 	DIR * dir = opendir(path->chars);
 	if (!dir) return krk_runtimeError(vm.exceptions->ioError, "opendir: %s", strerror(errno));
 
-	struct Directory * dirObj = (void *)krk_newInstance(Directory);
+	struct Directory * dirObj = (void *)krk_newInstance(KRK_BASE_CLASS(Directory));
 	krk_push(OBJECT_VAL(dirObj));
 
 	krk_attachNamedValue(&dirObj->inst.fields, "path", OBJECT_VAL(path));
 	dirObj->dirPtr = dir;
 
 	return krk_pop();
-})
+}
 
 #define CURRENT_CTYPE struct Directory *
 
-KRK_METHOD(Directory,__call__,{
+KRK_Method(Directory,__call__) {
 	METHOD_TAKES_NONE();
 	if (!self->dirPtr) return argv[0];
 	struct dirent * entry = readdir(self->dirPtr);
@@ -457,22 +461,23 @@ KRK_METHOD(Directory,__call__,{
 	krk_attachNamedValue(AS_DICT(outDict), "inode", INTEGER_VAL(entry->d_ino));
 
 	return krk_pop();
-})
+}
 
-KRK_METHOD(Directory,__iter__,{
+KRK_Method(Directory,__iter__) {
 	METHOD_TAKES_NONE();
 	return argv[0];
-})
+}
 
-KRK_METHOD(Directory,close,{
+KRK_Method(Directory,close) {
 	METHOD_TAKES_NONE();
 	if (self->dirPtr) {
 		closedir(self->dirPtr);
 		self->dirPtr = NULL;
 	}
-})
+	return NONE_VAL();
+}
 
-KRK_METHOD(Directory,__repr__,{
+KRK_Method(Directory,__repr__) {
 	METHOD_TAKES_NONE();
 	KrkValue path;
 	if (!krk_tableGet(&self->inst.fields, OBJECT_VAL(S("path")), &path) || !IS_STRING(path))
@@ -484,15 +489,16 @@ KRK_METHOD(Directory,__repr__,{
 	KrkString * out = krk_copyString(tmp, len);
 	free(tmp);
 	return OBJECT_VAL(out);
-})
+}
 
-KRK_METHOD(Directory,__enter__,{})
-KRK_METHOD(Directory,__exit__,{
+KRK_Method(Directory,__enter__) {
+	return NONE_VAL();
+}
+KRK_Method(Directory,__exit__) {
 	return FUNC_NAME(Directory,close)(1,argv,0);
-})
+}
 
-_noexport
-void _createAndBind_fileioMod(void) {
+void krk_module_init_fileio(void) {
 	KrkInstance * module = krk_newInstance(vm.baseClasses->moduleClass);
 	krk_attachNamedObject(&vm.modules, "fileio", (KrkObj*)module);
 	krk_attachNamedObject(&module->fields, "__name__", (KrkObj*)S("fileio"));
@@ -505,7 +511,7 @@ void _createAndBind_fileioMod(void) {
 	);
 
 	/* Define a class to represent files. (Should this be a helper method?) */
-	krk_makeClass(module, &File, "File", vm.baseClasses->objectClass);
+	KrkClass * File = krk_makeClass(module, &KRK_BASE_CLASS(File), "File", KRK_BASE_CLASS(object));
 	KRK_DOC(File,"Interface to a buffered file stream.");
 	File->allocSize = sizeof(struct File);
 	File->_ongcsweep = _file_sweep;
@@ -530,7 +536,7 @@ void _createAndBind_fileioMod(void) {
 	krk_defineNative(&File->methods, "__repr__", FUNC_NAME(File,__str__));
 	krk_finalizeClass(File);
 
-	krk_makeClass(module, &BinaryFile, "BinaryFile", File);
+	KrkClass * BinaryFile = krk_makeClass(module, &KRK_BASE_CLASS(BinaryFile), "BinaryFile", File);
 	KRK_DOC(BinaryFile,
 		"Equivalent to @ref File but using @ref bytes instead of string @ref str."
 	);
@@ -540,7 +546,7 @@ void _createAndBind_fileioMod(void) {
 	BIND_METHOD(BinaryFile,write);
 	krk_finalizeClass(BinaryFile);
 
-	krk_makeClass(module, &Directory, "Directory", vm.baseClasses->objectClass);
+	KrkClass * Directory = krk_makeClass(module, &KRK_BASE_CLASS(Directory), "Directory", KRK_BASE_CLASS(object));
 	KRK_DOC(Directory,
 		"Represents an opened file system directory."
 	);
@@ -556,9 +562,9 @@ void _createAndBind_fileioMod(void) {
 	krk_finalizeClass(Directory);
 
 	/* Make an instance for stdout, stderr, and stdin */
-	makeFileInstance(module, "stdin", stdin);
-	makeFileInstance(module, "stdout", stdout);
-	makeFileInstance(module, "stderr", stderr);
+	makeFileInstance(module, "stdin", stdin, "r");
+	makeFileInstance(module, "stdout", stdout, "w");
+	makeFileInstance(module, "stderr", stderr, "w");
 
 	/* Our base will be the open method */
 	KRK_DOC(BIND_FUNC(module,open), "@brief Open a file.\n"

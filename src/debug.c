@@ -6,6 +6,9 @@
 #include <kuroko/util.h>
 #include <kuroko/compiler.h>
 
+#include "private.h"
+#include "opcode_enum.h"
+
 #ifndef KRK_DISABLE_DEBUG
 
 /**
@@ -67,17 +70,17 @@ void krk_disassembleCodeObject(FILE * f, KrkCodeObject * func, const char * name
 	fprintf(f, "<%s(", name);
 	for (int i = 0; i < func->requiredArgs; ++i) {
 		fprintf(f,"%s",AS_CSTRING(func->requiredArgNames.values[i]));
-		if (i + 1 < func->requiredArgs || func->keywordArgs || !!(func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) || !!(func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS)) fprintf(f,",");
+		if (i + 1 < func->requiredArgs || func->keywordArgs || !!(func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) || !!(func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS)) fprintf(f,",");
 	}
 	for (int i = 0; i < func->keywordArgs; ++i) {
 		fprintf(f,"%s=...",AS_CSTRING(func->keywordArgNames.values[i]));
-		if (i + 1 < func->keywordArgs || !!(func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) || !!(func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS)) fprintf(f,",");
+		if (i + 1 < func->keywordArgs || !!(func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) || !!(func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS)) fprintf(f,",");
 	}
-	if (func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_ARGS) {
+	if (func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_ARGS) {
 		fprintf(f,"*%s", AS_CSTRING(func->requiredArgNames.values[func->requiredArgs]));
-		if (func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS) fprintf(f,",");
+		if (func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS) fprintf(f,",");
 	}
-	if (func->flags & KRK_CODEOBJECT_FLAGS_COLLECTS_KWS) {
+	if (func->obj.flags & KRK_OBJ_FLAGS_CODEOBJECT_COLLECTS_KWS) {
 		fprintf(f,"**%s", AS_CSTRING(func->keywordArgNames.values[func->keywordArgs]));
 	}
 	fprintf(f, ") from %s>\n", chunk->filename->chars);
@@ -114,6 +117,7 @@ static int isJumpTarget(KrkCodeObject * func, size_t startPoint) {
 	}
 #define EXPAND_ARGS_MORE
 #define LOCAL_MORE
+#define FORMAT_VALUE_MORE
 
 	while (offset < chunk->count) {
 		uint8_t opcode = chunk->code[offset];
@@ -132,6 +136,7 @@ static int isJumpTarget(KrkCodeObject * func, size_t startPoint) {
 #undef CLOSURE_MORE
 #undef LOCAL_MORE
 #undef EXPAND_ARGS_MORE
+#undef FORMAT_VALUE_MORE
 }
 
 #define SIMPLE(opc) case opc: fprintf(f, "%-16s      ", opcodeClean(#opc)); size = 1; break;
@@ -180,6 +185,17 @@ static int isJumpTarget(KrkCodeObject * func, size_t startPoint) {
 
 #define EXPAND_ARGS_MORE \
 	fprintf(f, " (%s)", operand == 0 ? "singleton" : (operand == 1 ? "list" : "dict"));
+
+#define FORMAT_VALUE_MORE \
+	if (operand != 0) {\
+		int hasThing = 0; \
+		fprintf(f, " ("); \
+		if (operand & FORMAT_OP_EQ)     { fprintf(f, "eq"); hasThing = 1; } \
+		if (operand & FORMAT_OP_STR)    { fprintf(f, "%sstr", hasThing ? ", " : ""); hasThing = 1; } \
+		if (operand & FORMAT_OP_REPR)   { fprintf(f, "%srepr", hasThing ? ", " : ""); hasThing = 1; } \
+		if (operand & FORMAT_OP_FORMAT) { fprintf(f, "%swith format", hasThing ? ", " : ""); } \
+		fprintf(f, ")"); \
+	}
 
 #define LOCAL_MORE \
 	if ((short int)operand < (func->requiredArgs)) { \
@@ -244,6 +260,7 @@ size_t krk_disassembleInstruction(FILE * f, KrkCodeObject * func, size_t offset)
 #undef CLOSURE_MORE
 #undef LOCAL_MORE
 #undef EXPAND_ARGS_MORE
+#undef FORMAT_VALUE_MORE
 
 struct BreakpointEntry {
 	KrkCodeObject * inFunction;
@@ -253,43 +270,41 @@ struct BreakpointEntry {
 };
 
 #define MAX_BREAKPOINTS 32
-static struct BreakpointEntry breakpoints[MAX_BREAKPOINTS] = {{0}};
-static int breakpointsCount = 0;
+struct DebuggerState {
+	int breakpointsCount;
+	KrkDebugCallback debuggerHook;
 
-static KrkDebugCallback _debugger_hook = NULL;
+	/* XXX This was previously thread-local; it probably should still be
+	 *     specific to an individual thread... but we don't really do
+	 *     much thread debugging, so... */
+	int repeatStack_top;
+	int repeatStack_bottom;
+	int thisWasForced;
 
-/* Internal state tracks re-enabling repeat breakpoints */
-#ifdef __toaru__
-__attribute__((tls_model("initial-exec"))) threadLocal int _repeatStack_top    = -1;
-__attribute__((tls_model("initial-exec"))) threadLocal int _repeatStack_bottom = -1;
-__attribute__((tls_model("initial-exec"))) threadLocal int _thisWasForced = 0;
-#else
-static threadLocal int _repeatStack_top    = -1;
-static threadLocal int _repeatStack_bottom = -1;
-static threadLocal int _thisWasForced = 0;
-#endif
+	struct BreakpointEntry breakpoints[MAX_BREAKPOINTS];
+};
 
 int krk_debug_addBreakpointCodeOffset(KrkCodeObject * target, size_t offset, int flags) {
-	int index = breakpointsCount;
-	if (breakpointsCount == MAX_BREAKPOINTS) {
+	int index = vm.dbgState->breakpointsCount;
+	if (vm.dbgState->breakpointsCount == MAX_BREAKPOINTS) {
 		/* See if any are available */
 		for (int i = 0; i < MAX_BREAKPOINTS; ++i) {
-			if (breakpoints[i].inFunction == NULL) {
+			if (vm.dbgState->breakpoints[i].inFunction == NULL) {
 				index = i;
 				break;
 			}
 		}
-		if (index == breakpointsCount) {
+		if (index == vm.dbgState->breakpointsCount) {
 			return -1;
 		}
 	} else {
-		index = breakpointsCount++;
+		index = vm.dbgState->breakpointsCount++;
 	}
 
-	breakpoints[index].inFunction = target;
-	breakpoints[index].offset = offset;
-	breakpoints[index].originalOpcode = target->chunk.code[offset];
-	breakpoints[index].flags = flags;
+	vm.dbgState->breakpoints[index].inFunction = target;
+	vm.dbgState->breakpoints[index].offset = offset;
+	vm.dbgState->breakpoints[index].originalOpcode = target->chunk.code[offset];
+	vm.dbgState->breakpoints[index].flags = flags;
 	target->chunk.code[offset] = OP_BREAKPOINT;
 
 	return index;
@@ -336,50 +351,53 @@ int krk_debug_addBreakpointFileLine(KrkString * filename, size_t line, int flags
 }
 
 int krk_debug_enableBreakpoint(int breakIndex) {
-	if (breakIndex < 0 || breakIndex >= breakpointsCount || breakpoints[breakIndex].inFunction == NULL)
+	if (breakIndex < 0 || breakIndex >= vm.dbgState->breakpointsCount || vm.dbgState->breakpoints[breakIndex].inFunction == NULL)
 		return 1;
-	breakpoints[breakIndex].inFunction->chunk.code[breakpoints[breakIndex].offset] = OP_BREAKPOINT;
+	vm.dbgState->breakpoints[breakIndex].inFunction->chunk.code[vm.dbgState->breakpoints[breakIndex].offset] = OP_BREAKPOINT;
 	return 0;
 }
-KRK_FUNC(enablebreakpoint,{
+KRK_Function(enablebreakpoint) {
 	CHECK_ARG(0,int,krk_integer_type,breakIndex);
 	if (krk_debug_enableBreakpoint(breakIndex))
 		return krk_runtimeError(vm.exceptions->indexError, "invalid breakpoint id");
-})
+	return NONE_VAL();
+}
 
 int krk_debug_disableBreakpoint(int breakIndex) {
-	if (breakIndex < 0 || breakIndex >= breakpointsCount || breakpoints[breakIndex].inFunction == NULL)
+	if (breakIndex < 0 || breakIndex >= vm.dbgState->breakpointsCount || vm.dbgState->breakpoints[breakIndex].inFunction == NULL)
 		return 1;
-	breakpoints[breakIndex].inFunction->chunk.code[breakpoints[breakIndex].offset] =
-		breakpoints[breakIndex].originalOpcode;
-	if (breakIndex == _repeatStack_top) {
-		_repeatStack_top = -1;
+	vm.dbgState->breakpoints[breakIndex].inFunction->chunk.code[vm.dbgState->breakpoints[breakIndex].offset] =
+		vm.dbgState->breakpoints[breakIndex].originalOpcode;
+	if (breakIndex == vm.dbgState->repeatStack_top) {
+		vm.dbgState->repeatStack_top = -1;
 	}
 	return 0;
 }
-KRK_FUNC(disablebreakpoint,{
+KRK_Function(disablebreakpoint) {
 	CHECK_ARG(0,int,krk_integer_type,breakIndex);
 	if (krk_debug_disableBreakpoint(breakIndex))
 		return krk_runtimeError(vm.exceptions->indexError, "invalid breakpoint id");
-})
+	return NONE_VAL();
+}
 
 int krk_debug_removeBreakpoint(int breakIndex) {
-	if (breakIndex < 0 || breakIndex >= breakpointsCount || breakpoints[breakIndex].inFunction == NULL)
+	if (breakIndex < 0 || breakIndex >= vm.dbgState->breakpointsCount || vm.dbgState->breakpoints[breakIndex].inFunction == NULL)
 		return 1;
 	krk_debug_disableBreakpoint(breakIndex);
-	breakpoints[breakIndex].inFunction = NULL;
-	while (breakpointsCount && breakpoints[breakpointsCount-1].inFunction == NULL) {
-		breakpointsCount--;
+	vm.dbgState->breakpoints[breakIndex].inFunction = NULL;
+	while (vm.dbgState->breakpointsCount && vm.dbgState->breakpoints[vm.dbgState->breakpointsCount-1].inFunction == NULL) {
+		vm.dbgState->breakpointsCount--;
 	}
 	return 0;
 }
-KRK_FUNC(delbreakpoint,{
+KRK_Function(delbreakpoint) {
 	CHECK_ARG(0,int,krk_integer_type,breakIndex);
 	if (krk_debug_removeBreakpoint(breakIndex))
 		return krk_runtimeError(vm.exceptions->indexError, "invalid breakpoint id");
-})
+	return NONE_VAL();
+}
 
-KRK_FUNC(addbreakpoint,{
+KRK_Function(addbreakpoint) {
 	FUNCTION_TAKES_EXACTLY(2);
 	CHECK_ARG(1,int,krk_integer_type,lineNo);
 
@@ -425,7 +443,7 @@ KRK_FUNC(addbreakpoint,{
 		return krk_runtimeError(vm.exceptions->baseException, "Could not add breakpoint.");
 
 	return INTEGER_VAL(result);
-})
+}
 
 /*
  * Begin debugger utility functions.
@@ -462,19 +480,19 @@ void krk_debug_disableSingleStep(void) {
 }
 
 int krk_debuggerHook(KrkCallFrame * frame) {
-	if (!_debugger_hook)
+	if (!vm.dbgState->debuggerHook)
 		abort();
 
-	if (_repeatStack_top != -1) {
+	if (vm.dbgState->repeatStack_top != -1) {
 		/* Re-enable stored repeat breakpoint */
-		krk_debug_enableBreakpoint(_repeatStack_top);
+		krk_debug_enableBreakpoint(vm.dbgState->repeatStack_top);
 	}
 
-	_repeatStack_top = _repeatStack_bottom;
-	_repeatStack_bottom = -1;
+	vm.dbgState->repeatStack_top = vm.dbgState->repeatStack_bottom;
+	vm.dbgState->repeatStack_bottom = -1;
 
-	if (!_thisWasForced) {
-		int result = _debugger_hook(frame);
+	if (!vm.dbgState->thisWasForced) {
+		int result = vm.dbgState->debuggerHook(frame);
 		switch (result) {
 			case KRK_DEBUGGER_CONTINUE:
 				krk_debug_disableSingleStep();
@@ -495,12 +513,12 @@ int krk_debuggerHook(KrkCallFrame * frame) {
 	} else {
 		/* If we weren't asked to step to the next breakpoint, we need to disable single stepping. */
 		krk_debug_disableSingleStep();
-		_thisWasForced = 0;
+		vm.dbgState->thisWasForced = 0;
 	}
 
 	/* If the top of the repeat stack is an index, we need to ensure we re-enable that breakpoint */
-	if (_repeatStack_top != -1 && !(krk_currentThread.flags & KRK_THREAD_SINGLE_STEP)) {
-		_thisWasForced = 1;
+	if (vm.dbgState->repeatStack_top != -1 && !(krk_currentThread.flags & KRK_THREAD_SINGLE_STEP)) {
+		vm.dbgState->thisWasForced = 1;
 		krk_debug_enableSingleStep();
 	}
 
@@ -508,21 +526,21 @@ int krk_debuggerHook(KrkCallFrame * frame) {
 }
 
 int krk_debug_registerCallback(KrkDebugCallback hook) {
-	if (_debugger_hook) return 1;
-	_debugger_hook = hook;
+	if (vm.dbgState->debuggerHook) return 1;
+	vm.dbgState->debuggerHook = hook;
 	return 0;
 }
 
 int krk_debug_examineBreakpoint(int breakIndex, KrkCodeObject ** funcOut, size_t * offsetOut, int * flagsOut, int * enabled) {
-	if (breakIndex < 0 || breakIndex >= breakpointsCount)
+	if (breakIndex < 0 || breakIndex >= vm.dbgState->breakpointsCount)
 		return -1;
-	if (breakpoints[breakIndex].inFunction == NULL)
+	if (vm.dbgState->breakpoints[breakIndex].inFunction == NULL)
 		return -2;
 
-	if (funcOut) *funcOut = breakpoints[breakIndex].inFunction;
-	if (offsetOut) *offsetOut = breakpoints[breakIndex].offset;
-	if (flagsOut) *flagsOut = breakpoints[breakIndex].flags;
-	if (enabled) *enabled = (breakpoints[breakIndex].inFunction->chunk.code[breakpoints[breakIndex].offset] == OP_BREAKPOINT) || breakIndex == _repeatStack_top;
+	if (funcOut) *funcOut = vm.dbgState->breakpoints[breakIndex].inFunction;
+	if (offsetOut) *offsetOut = vm.dbgState->breakpoints[breakIndex].offset;
+	if (flagsOut) *flagsOut = vm.dbgState->breakpoints[breakIndex].flags;
+	if (enabled) *enabled = (vm.dbgState->breakpoints[breakIndex].inFunction->chunk.code[vm.dbgState->breakpoints[breakIndex].offset] == OP_BREAKPOINT) || breakIndex == vm.dbgState->repeatStack_top;
 
 	return 0;
 }
@@ -534,8 +552,8 @@ int krk_debugBreakpointHandler(void) {
 	KrkCodeObject * callee = frame->closure->function;
 	size_t offset        = (frame->ip - 1) - callee->chunk.code;
 
-	for (int i = 0; i < breakpointsCount; ++i) {
-		if (breakpoints[i].inFunction == callee && breakpoints[i].offset == offset) {
+	for (int i = 0; i < vm.dbgState->breakpointsCount; ++i) {
+		if (vm.dbgState->breakpoints[i].inFunction == callee && vm.dbgState->breakpoints[i].offset == offset) {
 			index = i;
 		}
 	}
@@ -548,13 +566,13 @@ int krk_debugBreakpointHandler(void) {
 
 	/* Restore the instruction to its original state. If the debugger
 	 * wants to break here again it can set the breakpoint again */
-	callee->chunk.code[offset] = breakpoints[index].originalOpcode;
+	callee->chunk.code[offset] = vm.dbgState->breakpoints[index].originalOpcode;
 
 	/* If this was a single-shot, we can remove it. */
-	if (breakpoints[index].flags == KRK_BREAKPOINT_ONCE) {
+	if (vm.dbgState->breakpoints[index].flags == KRK_BREAKPOINT_ONCE) {
 		krk_debug_removeBreakpoint(index);
-	} else if (breakpoints[index].flags == KRK_BREAKPOINT_REPEAT) {
-		_repeatStack_bottom = index;
+	} else if (vm.dbgState->breakpoints[index].flags == KRK_BREAKPOINT_REPEAT) {
+		vm.dbgState->repeatStack_bottom = index;
 	}
 
 	/* Rewind to rerun this instruction. */
@@ -566,7 +584,7 @@ int krk_debugBreakpointHandler(void) {
 /**
  * dis.dis(object)
  */
-KRK_FUNC(dis,{
+KRK_Function(dis) {
 	FUNCTION_TAKES_EXACTLY(1);
 
 	if (IS_CLOSURE(argv[0])) {
@@ -585,7 +603,7 @@ KRK_FUNC(dis,{
 			krk_disassembleCodeObject(stdout, func, tmp);
 			free(tmp);
 		} else {
-			krk_runtimeError(vm.exceptions->typeError, "Can not disassemble built-in method of '%s'", krk_typeName(AS_BOUND_METHOD(argv[0])->receiver));
+			krk_runtimeError(vm.exceptions->typeError, "Can not disassemble built-in method of '%T'", AS_BOUND_METHOD(argv[0])->receiver);
 		}
 	} else if (IS_CLASS(argv[0])) {
 		KrkValue code;
@@ -595,13 +613,13 @@ KRK_FUNC(dis,{
 		}
 		/* TODO Methods! */
 	} else {
-		krk_runtimeError(vm.exceptions->typeError, "Don't know how to disassemble '%s'", krk_typeName(argv[0]));
+		krk_runtimeError(vm.exceptions->typeError, "Don't know how to disassemble '%T'", argv[0]);
 	}
 
 	return NONE_VAL();
-})
+}
 
-KRK_FUNC(build,{
+KRK_Function(build) {
 	FUNCTION_TAKES_AT_LEAST(1);
 	FUNCTION_TAKES_AT_MOST(2);
 	CHECK_ARG(0,str,KrkString*,code);
@@ -620,7 +638,7 @@ KRK_FUNC(build,{
 	krk_pop();
 	if (c) return OBJECT_VAL(c);
 	else return NONE_VAL();
-})
+}
 
 #define SIMPLE(opc) case opc: size = 1; break;
 #define CONSTANT(opc,more) case opc: { constant = chunk->code[offset + 1]; size = 2; more; break; } \
@@ -633,14 +651,17 @@ KRK_FUNC(build,{
 	size = 3; break; }
 #define CLOSURE_MORE \
 	KrkCodeObject * function = AS_codeobject(chunk->constants.values[constant]); \
+	size_t baseOffset = offset; \
 	for (size_t j = 0; j < function->upvalueCount; ++j) { \
-		int isLocal = chunk->code[offset++ + size]; \
-		offset++; \
+		int isLocal = chunk->code[baseOffset++ + size]; \
+		baseOffset++; \
 		if (isLocal & 2) { \
-			offset += 2; \
+			baseOffset += 2; \
 		} \
-	}
+	} \
+	size += baseOffset - offset;
 #define EXPAND_ARGS_MORE
+#define FORMAT_VALUE_MORE
 #define LOCAL_MORE local = operand;
 static KrkValue _examineInternal(KrkCodeObject* func) {
 	KrkValue output = krk_list_of(0,NULL,0);
@@ -698,11 +719,11 @@ static KrkValue _examineInternal(KrkCodeObject* func) {
 
 	return krk_pop();
 }
-KRK_FUNC(examine,{
+KRK_Function(examine) {
 	FUNCTION_TAKES_EXACTLY(1);
 	CHECK_ARG(0,codeobject,KrkCodeObject*,func);
 	return _examineInternal(func);
-})
+}
 
 #undef SIMPLE
 #undef OPERANDB
@@ -712,13 +733,18 @@ KRK_FUNC(examine,{
 #undef CLOSURE_MORE
 #undef LOCAL_MORE
 #undef EXPAND_ARGS_MORE
+#undef FORMAT_VALUE_MORE
 
-_noexport
-void _createAndBind_disMod(void) {
+void krk_module_init_dis(void) {
 	KrkInstance * module = krk_newInstance(vm.baseClasses->moduleClass);
 	krk_attachNamedObject(&vm.modules, "dis", (KrkObj*)module);
 	krk_attachNamedObject(&module->fields, "__name__", (KrkObj*)S("dis"));
 	krk_attachNamedValue(&module->fields, "__file__", NONE_VAL());
+
+	vm.dbgState = calloc(1, sizeof(struct DebuggerState));
+	vm.dbgState->repeatStack_top = -1;
+	vm.dbgState->repeatStack_bottom = -1;
+
 	KRK_DOC(module,
 		"@brief Provides tools for disassembling bytecode.\n\n"
 		"### Code Disassembly in Kuroko\n\n"
@@ -787,6 +813,7 @@ void _createAndBind_disMod(void) {
 #define JUMP(opc,sign) OPCODE(opc)
 #define CLOSURE_MORE
 #define EXPAND_ARGS_MORE
+#define FORMAT_VALUE_MORE
 #define LOCAL_MORE
 #include "opcodes.h"
 #undef SIMPLE
@@ -797,6 +824,7 @@ void _createAndBind_disMod(void) {
 #undef CLOSURE_MORE
 #undef LOCAL_MORE
 #undef EXPAND_ARGS_MORE
+#undef FORMAT_VALUE_MORE
 }
 
 #endif

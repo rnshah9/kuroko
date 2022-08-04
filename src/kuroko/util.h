@@ -25,8 +25,8 @@
 
 #define ADD_BASE_CLASS(obj, name, baseClass) krk_makeClass(vm.builtins, &obj, name, baseClass)
 
-#define ATTRIBUTE_NOT_ASSIGNABLE() do { if (unlikely(argc != 1)) return krk_runtimeError(vm.exceptions->attributeError, "'%s' object has no attribute '%s'", \
-	krk_typeName(argv[0]), _method_name); } while (0)
+#define ATTRIBUTE_NOT_ASSIGNABLE() do { if (unlikely(argc != 1)) return krk_runtimeError(vm.exceptions->attributeError, "'%T' object has no attribute '%s'", \
+	argv[0], _method_name); } while (0)
 
 #define METHOD_TAKES_NONE() do { if (unlikely(argc != 1)) return krk_runtimeError(vm.exceptions->argumentError, "%s() takes no arguments (%d given)", \
 	_method_name, (argc-1)); } while (0)
@@ -52,8 +52,8 @@
 #define FUNCTION_TAKES_AT_MOST(n) do { if (unlikely(argc > n)) return krk_runtimeError(vm.exceptions->argumentError, "%s() takes %s %d argument%s (%d given)", \
 	_method_name, "at most", n, (n != 1) ? "s" : "", (argc)); } while (0)
 
-#define TYPE_ERROR(expected,value) krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'", \
-		/* Function name */ _method_name, /* expected type */ #expected, krk_typeName(value))
+#define TYPE_ERROR(expected,value) krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%T'", \
+		/* Function name */ _method_name, /* expected type */ #expected, value)
 
 #define NOT_ENOUGH_ARGS(name) krk_runtimeError(vm.exceptions->argumentError, "Expected more args.")
 
@@ -63,14 +63,16 @@
 	ctype name __attribute__((unused)) = AS_ ## type (argv[i])
 
 #define FUNC_NAME(klass, name) _ ## klass ## _ ## name
-#define FUNC_SIG(klass, name) _noexport KrkValue FUNC_NAME(klass,name) (int argc, KrkValue argv[], int hasKw)
+#define FUNC_SIG(klass, name) _noexport KrkValue FUNC_NAME(klass,name) (int argc, const KrkValue argv[], int hasKw)
+
+/* These forms are deprecated. */
 #define KRK_METHOD(klass, name, ...) FUNC_SIG(klass, name) { \
 	static __attribute__ ((unused)) const char* _method_name = # name; \
 	CHECK_ARG(0,klass,CURRENT_CTYPE,CURRENT_NAME); \
 	__VA_ARGS__ \
 	return NONE_VAL(); }
 
-#define KRK_FUNC(name,...) static KrkValue _krk_ ## name (int argc, KrkValue argv[], int hasKw) { \
+#define KRK_FUNC(name,...) static KrkValue _krk_ ## name (int argc, const KrkValue argv[], int hasKw) { \
 	static __attribute__ ((unused)) const char* _method_name = # name; \
 	__VA_ARGS__ \
 	return NONE_VAL(); }
@@ -80,6 +82,33 @@
 #define BIND_METHOD(klass,method) krk_defineNative(&klass->methods, #method, _ ## klass ## _ ## method)
 #define BIND_PROP(klass,method) krk_defineNativeProperty(&klass->methods, #method, _ ## klass ## _ ## method)
 #define BIND_FUNC(module,func) krk_defineNative(&module->fields, #func, _krk_ ## func)
+
+#define KRK_Method_internal_name(klass, name) \
+	_krk_method_ ## klass ## _ ## name
+#define KRK_Method_internal_sig(klass, name) \
+	static inline KrkValue KRK_Method_internal_name(klass,name) (const char * _method_name, CURRENT_CTYPE CURRENT_NAME, int argc, const KrkValue argv[], int hasKw)
+
+#define KRK_Method(klass, name) \
+	KRK_Method_internal_sig(klass, name); \
+	FUNC_SIG(klass, name) { \
+		static const char * _method_name = # name; \
+		CHECK_ARG(0,klass,CURRENT_CTYPE,CURRENT_NAME); \
+		return KRK_Method_internal_name(klass,name)(_method_name, CURRENT_NAME, argc, argv, hasKw); \
+	} \
+	KRK_Method_internal_sig(klass,name)
+
+#define KRK_Function_internal_name(name) \
+	_krk_function_ ## name
+#define KRK_Function_internal_sig(name) \
+	static inline KrkValue KRK_Function_internal_name(name) (const char * _method_name, int argc, const KrkValue argv[], int hasKw)
+
+#define KRK_Function(name) \
+	KRK_Function_internal_sig(name); \
+	static KrkValue _krk_ ## name (int argc, const KrkValue argv[], int hasKw) { \
+		static const char* _method_name = # name; \
+		return KRK_Function_internal_name(name)(_method_name,argc,argv,hasKw); \
+	} \
+	KRK_Function_internal_sig(name)
 
 /**
  * @brief Inline flexible string array.
@@ -217,60 +246,13 @@ static inline KrkValue discardStringBuilder(struct StringBuilder * sb) {
 #define IS_slice(o) krk_isInstanceOf(o,vm.baseClasses->sliceClass)
 #define AS_slice(o) ((struct KrkSlice*)AS_INSTANCE(o))
 
-#ifndef unpackError
-#define unpackError(fromInput) return krk_runtimeError(vm.exceptions->typeError, "'%s' object is not iterable", krk_typeName(fromInput));
-#endif
-
 extern KrkValue krk_dict_nth_key_fast(size_t capacity, KrkTableEntry * entries, size_t index);
-extern KrkValue FUNC_NAME(str,__getitem__)(int,KrkValue*,int);
-extern KrkValue FUNC_NAME(str,__int__)(int,KrkValue*,int);
-extern KrkValue FUNC_NAME(str,__float__)(int,KrkValue*,int);
-extern KrkValue FUNC_NAME(str,split)(int,KrkValue*,int);
-extern KrkValue FUNC_NAME(str,format)(int,KrkValue*,int);
+extern KrkValue FUNC_NAME(str,__getitem__)(int,const KrkValue*,int);
+extern KrkValue FUNC_NAME(str,split)(int,const KrkValue*,int);
+extern KrkValue FUNC_NAME(str,format)(int,const KrkValue*,int);
 #define krk_string_get FUNC_NAME(str,__getitem__)
-#define krk_string_int FUNC_NAME(str,__int__)
-#define krk_string_float FUNC_NAME(str,__float__)
 #define krk_string_split FUNC_NAME(str,split)
 #define krk_string_format FUNC_NAME(str,format)
-
-#define unpackIterable(fromInput) do { \
-	KrkClass * type = krk_getType(fromInput); \
-	if (type->_iter) { \
-		size_t stackOffset = krk_currentThread.stackTop - krk_currentThread.stack; \
-		krk_push(fromInput); \
-		krk_push(krk_callDirect(type->_iter,1)); \
-		do { \
-			krk_push(krk_currentThread.stack[stackOffset]); \
-			krk_push(krk_callStack(0)); \
-			if (krk_valuesSame(krk_currentThread.stack[stackOffset], krk_peek(0))) { \
-				krk_pop(); \
-				krk_pop(); \
-				break; \
-			} \
-			unpackArray(1,krk_peek(0)); \
-			krk_pop(); \
-		} while (1); \
-	} else { \
-		unpackError(fromInput); \
-	} \
-} while (0)
-
-#define unpackIterableFast(fromInput) do { \
-	__attribute__((unused)) int unpackingIterable = 0; \
-	KrkValue iterableValue = (fromInput); \
-	if (IS_TUPLE(iterableValue)) { \
-		unpackArray(AS_TUPLE(iterableValue)->values.count, AS_TUPLE(iterableValue)->values.values[i]); \
-	} else if (IS_INSTANCE(iterableValue) && AS_INSTANCE(iterableValue)->_class == vm.baseClasses->listClass) { \
-		unpackArray(AS_LIST(iterableValue)->count, AS_LIST(iterableValue)->values[i]); \
-	} else if (IS_INSTANCE(iterableValue) && AS_INSTANCE(iterableValue)->_class == vm.baseClasses->dictClass) { \
-		unpackArray(AS_DICT(iterableValue)->count, krk_dict_nth_key_fast(AS_DICT(iterableValue)->capacity, AS_DICT(iterableValue)->entries, i)); \
-	} else if (IS_STRING(iterableValue)) { \
-		unpackArray(AS_STRING(iterableValue)->codesLength, krk_string_get(2,(KrkValue[]){iterableValue,INTEGER_VAL(i)},0)); \
-	} else { \
-		unpackingIterable = 1; \
-		unpackIterable(iterableValue); \
-	} \
-} while (0)
 
 static inline void _setDoc_class(KrkClass * thing, const char * text, size_t size) {
 	thing->docstring = krk_copyString(text, size);
@@ -315,3 +297,43 @@ extern int krk_extractSlicer(const char * _method_name, KrkValue slicerVal, krk_
 	krk_integer_type step; \
 	if (krk_extractSlicer(_method_name, arg, count, &start, &end, &step)) 
 
+/**
+ * @brief Unpack an iterable.
+ *
+ * Unpacks an iterable value, passing a series of arrays of values to a callback, @p callback.
+ *
+ * If @p iterable is a list or tuple, @p callback will be called once with the total size of the container.
+ * Otherwise, @p callback will be called many times with a count of 1, until the iterable is exhausted.
+ *
+ * If @p iterable is not iterable, an exception is set and 1 is returned.
+ * If @p callback returns non-zero, unpacking stops and 1 is returned, with no additional exception.
+ */
+extern int krk_unpackIterable(KrkValue iterable, void * context, int callback(void *, const KrkValue *, size_t));
+
+
+#define KRK_BASE_CLASS(cls) (vm.baseClasses->cls ## Class)
+#define KRK_EXC(exc) (vm.exceptions->exc)
+
+
+extern int krk_parseVArgs(
+		const char * _method_name,
+		int argc, const KrkValue argv[], int hasKw,
+		const char * fmt, const char ** names, va_list args);
+
+extern int krk_parseArgs_impl(
+		const char * _method_name,
+		int argc, const KrkValue argv[], int hasKw,
+		const char * format, const char ** names, ...);
+
+/**
+ * @def krk_parseArgs(f,n,...)
+ * @brief Parse arguments to a function while accepting keyword arguments.
+ *
+ * Convenience macro for @c krk_parseArgs_impl to avoid needing to pass all of
+ * the implicit arguments normally provided to a KRK_Function or KRK_Method.
+ *
+ * @param f Format string.
+ * @param n Names array.
+ * @returns 1 on success, 0 on failure with an exception set.
+ */
+#define krk_parseArgs(f,n,...) krk_parseArgs_impl(_method_name,argc,argv,hasKw,f,n,__VA_ARGS__)

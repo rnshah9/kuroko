@@ -8,16 +8,29 @@
 #include <kuroko/memory.h>
 #include <kuroko/util.h>
 
+#include "private.h"
+#include "opcode_enum.h"
+
 /**
  * @def ADD_EXCEPTION_CLASS(obj,name,baseClass)
  *
  * Convenience macro for creating exception types.
  */
-#define ADD_EXCEPTION_CLASS(obj,name,baseClass) do { \
-	obj = krk_newClass(S(name), baseClass); \
-	krk_attachNamedObject(&vm.builtins->fields, name, (KrkObj*)obj); \
+#define ADD_EXCEPTION_CLASS(obj,name,baseClass) KrkClass * name; do { \
+	ADD_BASE_CLASS(obj,#name,baseClass); \
 	krk_finalizeClass(obj); \
+	name = obj; \
+	(void)name; \
 } while (0)
+
+#define IS_Exception(o)    (likely(krk_isInstanceOf(o,vm.exceptions->baseException)))
+#define AS_Exception(o)    (AS_INSTANCE(o))
+#define IS_KeyError(o)     (likely(krk_isInstanceOf(o,vm.exceptions->keyError)))
+#define AS_KeyError(o)     (AS_INSTANCE(o))
+#define IS_SyntaxError(o)  (likely(krk_isInstanceOf(o,vm.exceptions->syntaxError)))
+#define AS_SyntaxError(o)  (AS_INSTANCE(o))
+#define CURRENT_CTYPE KrkInstance*
+#define CURRENT_NAME  self
 
 /**
  * @brief Initialize an exception object.
@@ -26,9 +39,12 @@
  *
  * @param arg Optional string to attach to the exception object.
  */
-static KrkValue krk_initException(int argc, KrkValue argv[], int hasKw) {
-	KrkInstance * self = AS_INSTANCE(argv[0]);
-	krk_attachNamedValue(&self->fields, "arg", argc > 1 ? argv[1] : NONE_VAL());
+KRK_Method(Exception,__init__) {
+	if (argc > 1) {
+		krk_attachNamedValue(&self->fields, "arg", argv[1]);
+	}
+	krk_attachNamedValue(&self->fields, "__cause__", NONE_VAL());
+	krk_attachNamedValue(&self->fields, "__context__", NONE_VAL());
 	return argv[0];
 }
 
@@ -39,8 +55,7 @@ static KrkValue krk_initException(int argc, KrkValue argv[], int hasKw) {
  *
  * Generates a string representation of the form @c "Exception(arg)" .
  */
-static KrkValue _exception_repr(int argc, KrkValue argv[], int hasKw) {
-	KrkInstance * self = AS_INSTANCE(argv[0]);
+KRK_Method(Exception,__repr__) {
 	KrkValue arg;
 	struct StringBuilder sb = {0};
 
@@ -67,17 +82,33 @@ static KrkValue _exception_repr(int argc, KrkValue argv[], int hasKw) {
  * For most exceptions, this is the 'arg' value attached at initialization
  * and is printed during a traceback after the name of the exception type.
  */
-static KrkValue _exception_str(int argc, KrkValue argv[], int hasKw) {
-	KrkInstance * self = AS_INSTANCE(argv[0]);
+KRK_Method(Exception,__str__) {
 	KrkValue arg;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("arg")), &arg) || IS_NONE(arg)) {
-		return NONE_VAL();
+		return OBJECT_VAL(S(""));
 	} else if (!IS_STRING(arg)) {
-		krk_push(arg);
-		return krk_callDirect(krk_getType(arg)->_tostr, 1);
+		KrkClass * type = krk_getType(arg);
+		if (type->_tostr) {
+			krk_push(arg);
+			return krk_callDirect(krk_getType(arg)->_tostr, 1);
+		}
+		return OBJECT_VAL(S(""));
 	} else {
 		return arg;
 	}
+}
+
+KRK_Method(KeyError,__str__) {
+	if (!IS_INSTANCE(argv[0])) return NONE_VAL(); /* uh oh */
+	KrkValue arg;
+	if (krk_tableGet(&self->fields, OBJECT_VAL(S("arg")), &arg)) {
+		KrkClass * type = krk_getType(arg);
+		if (type->_reprer) {
+			krk_push(arg);
+			return krk_callDirect(krk_getType(arg)->_reprer, 1);
+		}
+	}
+	return FUNC_NAME(Exception,__str__)(argc,argv,hasKw);
 }
 
 /**
@@ -91,20 +122,30 @@ static KrkValue _exception_str(int argc, KrkValue argv[], int hasKw) {
  * {str(Exception)} for syntax errors and they handle the rest. This is a bit
  * of a kludge, but it works for now.
  */
-static KrkValue _syntaxerror_str(int argc, KrkValue argv[], int hasKw) {
-	KrkInstance * self = AS_INSTANCE(argv[0]);
+KRK_Method(SyntaxError,__str__) {
 	/* .arg */
-	KrkValue file, line, lineno, colno, arg, func;
+	KrkValue file, line, lineno, colno, arg, func, width;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("file")), &file) || !IS_STRING(file)) goto _badSyntaxError;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("line")), &line) || !IS_STRING(line)) goto _badSyntaxError;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("lineno")), &lineno) || !IS_INTEGER(lineno)) goto _badSyntaxError;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("colno")), &colno) || !IS_INTEGER(colno)) goto _badSyntaxError;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("arg")), &arg) || !IS_STRING(arg)) goto _badSyntaxError;
 	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("func")), &func)) goto _badSyntaxError;
+	if (!krk_tableGet(&self->fields, OBJECT_VAL(S("width")), &width) || !IS_INTEGER(width)) goto _badSyntaxError;
 
 	if (AS_INTEGER(colno) <= 0) colno = INTEGER_VAL(1);
 
-	krk_push(OBJECT_VAL(S("  File \"{}\", line {}{}\n    {}\n    {}^\n{}: {}")));
+	int definitelyNotFullWidth = !(AS_STRING(line)->obj.flags & KRK_OBJ_FLAGS_STRING_MASK);
+
+	krk_push(OBJECT_VAL(S("^")));
+	if (definitelyNotFullWidth && AS_INTEGER(width) > 1) {
+		for (krk_integer_type i = 1; i < AS_INTEGER(width); ++i) {
+			krk_push(OBJECT_VAL(S("^")));
+			krk_addObjects();
+		}
+	}
+
+	krk_push(OBJECT_VAL(S("  File \"{}\", line {}{}\n    {}\n    {}{}\n{}: {}")));
 	unsigned int column = AS_INTEGER(colno);
 	char * tmp = malloc(column);
 	memset(tmp,' ',column);
@@ -118,12 +159,13 @@ static KrkValue _syntaxerror_str(int argc, KrkValue argv[], int hasKw) {
 	} else {
 		krk_push(OBJECT_VAL(S("")));
 	}
-	KrkValue formattedString = krk_string_format(8,
-		(KrkValue[]){krk_peek(3), file, lineno, krk_peek(0), line, krk_peek(2), krk_peek(1), arg}, 0);
+	KrkValue formattedString = krk_string_format(9,
+		(KrkValue[]){krk_peek(3), file, lineno, krk_peek(0), line, krk_peek(2), krk_peek(4), krk_peek(1), arg}, 0);
 	krk_pop(); /* instr */
 	krk_pop(); /* class */
 	krk_pop(); /* spaces */
 	krk_pop(); /* format string */
+	krk_pop(); /* carets */
 
 	return formattedString;
 
@@ -141,27 +183,391 @@ _badSyntaxError:
 _noexport
 void _createAndBind_exceptions(void) {
 	/* Add exception classes */
-	ADD_EXCEPTION_CLASS(vm.exceptions->baseException, "Exception", vm.baseClasses->objectClass);
-	/* base exception class gets an init that takes an optional string */
-	krk_defineNative(&vm.exceptions->baseException->methods, "__init__", krk_initException);
-	krk_defineNative(&vm.exceptions->baseException->methods, "__repr__", _exception_repr);
-	krk_defineNative(&vm.exceptions->baseException->methods, "__str__", _exception_str);
-	krk_finalizeClass(vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->typeError, "TypeError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->argumentError, "ArgumentError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->indexError, "IndexError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->keyError, "KeyError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->attributeError, "AttributeError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->nameError, "NameError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->importError, "ImportError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->ioError, "IOError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->valueError, "ValueError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->keyboardInterrupt, "KeyboardInterrupt", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->zeroDivisionError, "ZeroDivisionError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->notImplementedError, "NotImplementedError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->assertionError, "AssertionError", vm.exceptions->baseException);
-	ADD_EXCEPTION_CLASS(vm.exceptions->syntaxError, "SyntaxError", vm.exceptions->baseException);
-	krk_defineNative(&vm.exceptions->syntaxError->methods, "__str__", _syntaxerror_str);
-	krk_finalizeClass(vm.exceptions->syntaxError);
+	ADD_EXCEPTION_CLASS(vm.exceptions->baseException, Exception, vm.baseClasses->objectClass);
+	BIND_METHOD(Exception,__init__);
+	BIND_METHOD(Exception,__repr__);
+	BIND_METHOD(Exception,__str__);
+	krk_finalizeClass(Exception);
+
+	ADD_EXCEPTION_CLASS(vm.exceptions->typeError, TypeError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->argumentError, ArgumentError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->indexError, IndexError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->keyError, KeyError, Exception);
+	BIND_METHOD(KeyError,__str__);
+	krk_finalizeClass(KeyError);
+
+	ADD_EXCEPTION_CLASS(vm.exceptions->attributeError, AttributeError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->nameError, NameError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->importError, ImportError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->ioError, IOError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->valueError, ValueError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->keyboardInterrupt, KeyboardInterrupt, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->zeroDivisionError, ZeroDivisionError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->notImplementedError, NotImplementedError, Exception);
+	ADD_EXCEPTION_CLASS(vm.exceptions->assertionError, AssertionError, vm.exceptions->baseException);
+
+	ADD_EXCEPTION_CLASS(vm.exceptions->syntaxError, SyntaxError, vm.exceptions->baseException);
+	BIND_METHOD(SyntaxError,__str__);
+	krk_finalizeClass(SyntaxError);
 }
 
+static void dumpInnerException(KrkValue exception, int depth) {
+	if (depth > 10) {
+		fprintf(stderr, "Too many inner exceptions encountered.\n");
+		return;
+	}
+
+	krk_push(exception);
+	if (IS_INSTANCE(exception)) {
+
+		KrkValue inner;
+
+		/* Print cause or context */
+		if (krk_tableGet(&AS_INSTANCE(exception)->fields, OBJECT_VAL(S("__cause__")), &inner) && !IS_NONE(inner)) {
+			dumpInnerException(inner, depth + 1);
+			fprintf(stderr, "\nThe above exception was the direct cause of the following exception:\n\n");
+		} else if (krk_tableGet(&AS_INSTANCE(exception)->fields, OBJECT_VAL(S("__context__")), &inner) && !IS_NONE(inner)) {
+			dumpInnerException(inner, depth + 1);
+			fprintf(stderr, "\nDuring handling of the above exception, another exception occurred:\n\n");
+		}
+
+		KrkValue tracebackEntries;
+		if (krk_tableGet(&AS_INSTANCE(exception)->fields, OBJECT_VAL(S("traceback")), &tracebackEntries)
+			&& IS_list(tracebackEntries) && AS_LIST(tracebackEntries)->count > 0) {
+
+			/* This exception has a traceback we can print. */
+			fprintf(stderr, "Traceback (most recent call last):\n");
+			for (size_t i = 0; i < AS_LIST(tracebackEntries)->count; ++i) {
+
+				/* Quietly skip invalid entries as we don't want to bother printing explanatory text for them */
+				if (!IS_TUPLE(AS_LIST(tracebackEntries)->values[i])) continue;
+				KrkTuple * entry = AS_TUPLE(AS_LIST(tracebackEntries)->values[i]);
+				if (entry->values.count != 2) continue;
+				if (!IS_CLOSURE(entry->values.values[0])) continue;
+				if (!IS_INTEGER(entry->values.values[1])) continue;
+
+				/* Get the function and instruction index from this traceback entry */
+				KrkClosure * closure = AS_CLOSURE(entry->values.values[0]);
+				KrkCodeObject * function = closure->function;
+				size_t instruction = AS_INTEGER(entry->values.values[1]);
+
+				/* Calculate the line number */
+				int lineNo = (int)krk_lineNumber(&function->chunk, instruction);
+
+				/* Print the simple stuff that we already know */
+				fprintf(stderr, "  File \"%s\", line %d, in %s\n",
+					(function->chunk.filename ? function->chunk.filename->chars : "?"),
+					lineNo,
+					(function->name ? function->name->chars : "(unnamed)"));
+
+#ifndef NO_SOURCE_IN_TRACEBACK
+			/* Try to open the file */
+			if (function->chunk.filename) {
+				FILE * f = fopen(function->chunk.filename->chars, "r");
+				if (f) {
+					int line = 1;
+					do {
+						int c = fgetc(f);
+						if (c < -1) break;
+						if (c == '\n') {
+							line++;
+							continue;
+						}
+						if (line == lineNo) {
+							fprintf(stderr,"    ");
+							while (c == ' ') c = fgetc(f);
+							do {
+								fputc(c, stderr);
+								c = fgetc(f);
+							} while (!feof(f) && c > 0 && c != '\n');
+							fprintf(stderr, "\n");
+							break;
+						}
+					} while (!feof(f));
+					fclose(f);
+				}
+			}
+#endif
+			}
+		}
+	}
+
+	/* Is this a SyntaxError? Handle those specially. */
+	if (krk_isInstanceOf(exception, vm.exceptions->syntaxError)) {
+		KrkValue result = krk_callDirect(krk_getType(exception)->_tostr, 1);
+		fprintf(stderr, "%s\n", AS_CSTRING(result));
+		return;
+	}
+
+	/* Clear the exception state while printing the exception. */
+	int hadException = krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION;
+	krk_currentThread.flags &= ~(KRK_THREAD_HAS_EXCEPTION);
+
+	/* Prepare to print exception name with prefixed module, if it's not __builtins__. */
+	KrkClass * type = krk_getType(exception);
+	KrkValue module = NONE_VAL();
+	krk_tableGet(&type->methods, OBJECT_VAL(S("__module__")), &module);
+	if (!(IS_NONE(module) || (IS_STRING(module) && AS_STRING(module) == S("builtins")))) {
+		fprintf(stderr, "%s.", AS_CSTRING(module));
+	}
+
+	/* Print type name */
+	fprintf(stderr, "%s", krk_typeName(exception));
+
+	/* Stringify it. */
+	KrkValue result = krk_callDirect(krk_getType(exception)->_tostr, 1);
+	if (!IS_STRING(result) || AS_STRING(result)->length == 0) {
+		fprintf(stderr, "\n");
+	} else {
+		fprintf(stderr, ": ");
+		fwrite(AS_CSTRING(result), AS_STRING(result)->length, 1, stderr);
+		fprintf(stderr, "\n");
+	}
+
+	/* Turn the exception flag back on */
+	krk_currentThread.flags |= hadException;
+}
+
+/**
+ * Display a traceback by scanning up the stack / call frames.
+ * The format of the output here is modeled after the output
+ * given by CPython, so we display the outermost call first
+ * and then move inwards; on each call frame we try to open
+ * the source file and print the corresponding line.
+ */
+void krk_dumpTraceback(void) {
+	if (!krk_valuesEqual(krk_currentThread.currentException,NONE_VAL())) {
+		dumpInnerException(krk_currentThread.currentException, 0);
+	}
+}
+
+/**
+ * Attach a traceback to the current exception object, if it doesn't already have one.
+ */
+static void attachTraceback(void) {
+	if (IS_INSTANCE(krk_currentThread.currentException)) {
+		KrkInstance * theException = AS_INSTANCE(krk_currentThread.currentException);
+		KrkValue tracebackList;
+		if (krk_tableGet(&theException->fields, OBJECT_VAL(S("traceback")), &tracebackList)) {
+			krk_push(tracebackList);
+		} else {
+			krk_push(NONE_VAL());
+		}
+		tracebackList = krk_list_of(0,NULL,0);
+		krk_push(tracebackList);
+
+		/* Build the traceback object */
+		if (krk_currentThread.frameCount) {
+
+			/* Go up until we get to the exit frame */
+			size_t frameOffset = 0;
+			if (krk_currentThread.stackTop > krk_currentThread.stack) {
+				size_t stackOffset = krk_currentThread.stackTop - krk_currentThread.stack - 1;
+				while (stackOffset > 0 && !IS_HANDLER_TYPE(krk_currentThread.stack[stackOffset], OP_PUSH_TRY)) stackOffset--;
+				frameOffset = krk_currentThread.frameCount - 1;
+				while (frameOffset > 0 && krk_currentThread.frames[frameOffset].slots > stackOffset) frameOffset--;
+			}
+
+			for (size_t i = frameOffset; i < krk_currentThread.frameCount; i++) {
+				KrkCallFrame * frame = &krk_currentThread.frames[i];
+				KrkTuple * tbEntry = krk_newTuple(2);
+				krk_push(OBJECT_VAL(tbEntry));
+				tbEntry->values.values[tbEntry->values.count++] = OBJECT_VAL(frame->closure);
+				tbEntry->values.values[tbEntry->values.count++] = INTEGER_VAL(frame->ip - frame->closure->function->chunk.code - 1);
+				krk_writeValueArray(AS_LIST(tracebackList), OBJECT_VAL(tbEntry));
+				krk_pop();
+			}
+		}
+
+		if (IS_list(krk_peek(1))) {
+			KrkValueArray * existingTraceback = AS_LIST(krk_peek(1));
+			for (size_t i = 0; i < existingTraceback->count; ++i) {
+				krk_writeValueArray(AS_LIST(tracebackList), existingTraceback->values[i]);
+			}
+		}
+
+		krk_attachNamedValue(&theException->fields, "traceback", tracebackList);
+		krk_pop();
+		krk_pop();
+	} /* else: probably a legacy 'raise str', just don't bother. */
+}
+
+void krk_attachInnerException(KrkValue innerException) {
+	if (IS_INSTANCE(krk_currentThread.currentException)) {
+		KrkInstance * theException = AS_INSTANCE(krk_currentThread.currentException);
+		if (krk_valuesSame(krk_currentThread.currentException,innerException)) {
+			/* re-raised? */
+			return;
+		} else {
+			krk_attachNamedValue(&theException->fields, "__context__", innerException);
+		}
+	}
+}
+
+void krk_raiseException(KrkValue base, KrkValue cause) {
+	if (IS_CLASS(base)) {
+		krk_push(base);
+		base = krk_callStack(0);
+	}
+	krk_currentThread.currentException = base;
+	if (IS_CLASS(cause)) {
+		krk_push(cause);
+		cause = krk_callStack(0);
+	}
+	if (IS_INSTANCE(krk_currentThread.currentException) && !IS_NONE(cause)) {
+		krk_attachNamedValue(&AS_INSTANCE(krk_currentThread.currentException)->fields,
+			"__cause__", cause);
+	}
+	attachTraceback();
+	krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
+}
+
+/**
+ * Raise an exception. Creates an exception object of the requested type
+ * and formats a message string to attach to it. Exception classes are
+ * found in vm.exceptions and are initialized on startup.
+ */
+KrkValue krk_runtimeError(KrkClass * type, const char * fmt, ...) {
+	KrkValue msg = KWARGS_VAL(0);
+	struct StringBuilder sb = {0};
+
+	va_list args;
+	va_start(args, fmt);
+
+	if (!strcmp(fmt,"%V")) {
+		msg = va_arg(args, KrkValue);
+		goto _finish;
+	}
+
+	for (const char * f = fmt; *f; ++f) {
+		if (*f != '%') {
+			pushStringBuilder(&sb, *f);
+			continue;
+		}
+
+		/* Unset exception flag if it was already set. */
+		if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) {
+			krk_currentThread.flags &= ~(KRK_THREAD_HAS_EXCEPTION);
+		}
+
+		++f;
+
+		int size = ' ';
+		int len  = -1;
+
+		if (*f == 'z') size = *f++;
+		else if (*f == 'l') size = *f++;
+		else if (*f == 'L') size = *f++;
+
+		if (*f == '.') {
+			if (f[1] == '*') {
+				len = va_arg(args, int);
+				f += 2;
+			}
+		}
+
+		switch (*f) {
+			case 0: break;
+			case '%':
+				pushStringBuilder(&sb, '%');
+				break;
+
+			case 'c': {
+				char val = (char)va_arg(args, int);
+				pushStringBuilder(&sb, val);
+				break;
+			}
+
+			case 's': {
+				const char * c = va_arg(args, const char *);
+				pushStringBuilderStr(&sb, c, len == -1 ? strlen(c) : (size_t)len);
+				break;
+			}
+
+			case 'u': {
+				size_t val = 0;
+				if (size == ' ') {
+					val = va_arg(args, unsigned int);
+				} else if (size == 'l') {
+					val = va_arg(args, unsigned long);
+				} else if (size == 'L') {
+					val = va_arg(args, unsigned long long);
+				} else if (size == 'z') {
+					val = va_arg(args, size_t);
+				}
+				char tmp[100];
+				snprintf(tmp, 32, "%zu", val);
+				pushStringBuilderStr(&sb, tmp, strlen(tmp));
+				break;
+			}
+
+			case 'd': {
+				ssize_t val = 0;
+				if (size == ' ') {
+					val = va_arg(args, int);
+				} else if (size == 'l') {
+					val = va_arg(args, long);
+				} else if (size == 'L') {
+					val = va_arg(args, long long);
+				} else if (size == 'z') {
+					val = va_arg(args, ssize_t);
+				}
+				char tmp[100];
+				snprintf(tmp, 32, "%zd", val);
+				pushStringBuilderStr(&sb, tmp, strlen(tmp));
+				break;
+			}
+
+			case 'T': {
+				KrkValue val = va_arg(args, KrkValue);
+				const char * typeName = krk_typeName(val);
+				pushStringBuilderStr(&sb, typeName, strlen(typeName));
+				break;
+			}
+
+			case 'S': {
+				KrkString * val = va_arg(args, KrkString*);
+				pushStringBuilderStr(&sb, val->chars, val->length);
+				break;
+			}
+
+			case 'R': {
+				KrkValue val = va_arg(args, KrkValue);
+				KrkClass * type = krk_getType(val);
+				if (likely(type->_reprer != NULL)) {
+					krk_push(val);
+					KrkValue res = krk_callDirect(type->_reprer, 1);
+					if (IS_STRING(res)) {
+						pushStringBuilderStr(&sb, AS_CSTRING(res), AS_STRING(res)->length);
+					}
+				}
+				break;
+			}
+
+			default: {
+				va_arg(args, void*);
+				pushStringBuilderStr(&sb, "(unsupported: ", 14);
+				pushStringBuilder(&sb, *f);
+				pushStringBuilder(&sb, ')');
+				break;
+			}
+		}
+	}
+
+_finish:
+	va_end(args);
+	krk_currentThread.flags |= KRK_THREAD_HAS_EXCEPTION;
+
+	/* Allocate an exception object of the requested type. */
+	KrkInstance * exceptionObject = krk_newInstance(type);
+	krk_push(OBJECT_VAL(exceptionObject));
+	krk_attachNamedValue(&exceptionObject->fields, "arg", msg == KWARGS_VAL(0) ? finishStringBuilder(&sb) : msg);
+	krk_attachNamedValue(&exceptionObject->fields, "__cause__", NONE_VAL());
+	krk_attachNamedValue(&exceptionObject->fields, "__context__", NONE_VAL());
+	krk_pop();
+
+	/* Set the current exception to be picked up by handleException */
+	krk_currentThread.currentException = OBJECT_VAL(exceptionObject);
+	attachTraceback();
+	return NONE_VAL();
+}
